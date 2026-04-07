@@ -16,9 +16,9 @@ STATE_FILE = ANAH_DIR / "state.json"
 DB_FILE = ANAH_DIR / "anah.db"
 
 # ---------------------------------------------------------------------------
-# Database schema (auto-created if missing)
+# Database schema — versioned migrations
 # ---------------------------------------------------------------------------
-SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS health_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   REAL NOT NULL,
@@ -72,11 +72,80 @@ CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status, priority 
 CREATE INDEX IF NOT EXISTS idx_generated_goals_ts ON generated_goals(timestamp DESC);
 """
 
+# Migration 2: Add indexes for approval queries and trajectory export
+MIGRATION_V2 = """
+CREATE INDEX IF NOT EXISTS idx_task_queue_completed ON task_queue(completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generated_goals_status ON generated_goals(status, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_health_logs_check ON health_logs(check_name, timestamp DESC);
+"""
+
+# Migration 3: Add topic_hash and discord_message_id to generated_goals for dedup and bot
+MIGRATION_V3 = """
+ALTER TABLE generated_goals ADD COLUMN topic_hash TEXT;
+ALTER TABLE generated_goals ADD COLUMN discord_message_id TEXT;
+ALTER TABLE generated_goals ADD COLUMN expires_at REAL;
+"""
+
+# Ordered list of migrations — each entry is (version, sql)
+MIGRATIONS = [
+    (1, SCHEMA_V1),
+    (2, MIGRATION_V2),
+    (3, MIGRATION_V3),
+]
+
+CURRENT_SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def _get_schema_version(db: sqlite3.Connection) -> int:
+    """Get current schema version from DB."""
+    try:
+        row = db.execute(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else 0
+    except sqlite3.OperationalError:
+        # schema_version table doesn't exist yet
+        return 0
+
+
+def _run_migrations(db: sqlite3.Connection):
+    """Run pending migrations."""
+    # Ensure schema_version table exists
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version     INTEGER PRIMARY KEY,
+            applied_at  REAL NOT NULL,
+            description TEXT
+        )
+    """)
+
+    current = _get_schema_version(db)
+
+    for version, sql in MIGRATIONS:
+        if version <= current:
+            continue
+        # Run migration, handling ALTER TABLE failures for already-existing columns
+        for statement in sql.strip().split(";"):
+            statement = statement.strip()
+            if not statement:
+                continue
+            try:
+                db.execute(statement)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" is OK — column already exists
+                if "duplicate column" not in str(e).lower():
+                    raise
+        db.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+            (version, time.time(), f"Migration v{version}"),
+        )
+        db.commit()
+
 
 def get_db() -> sqlite3.Connection:
     db = sqlite3.connect(str(DB_FILE))
     db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
+    _run_migrations(db)
     return db
 
 

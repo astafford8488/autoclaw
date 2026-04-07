@@ -39,6 +39,8 @@ try:
 except ImportError:
     discord_notify = None
 
+import backup
+
 
 # ---------------------------------------------------------------------------
 # Interval presets (seconds)
@@ -271,8 +273,28 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
 
     orchestrator.load_env()
 
+    # Startup: check DB integrity and restore if needed
+    integrity = backup.check_integrity()
+    if integrity["status"] == "corrupt":
+        log_structured("ERROR", "startup", "Database corrupt — attempting restore",
+                       integrity=integrity["message"])
+        write_notification("critical", "Database Corruption Detected",
+                           f"Integrity check failed: {integrity['message']}. Attempting restore.")
+        restore_result = backup.restore_backup()
+        if "error" in restore_result:
+            log_structured("ERROR", "startup", f"Restore failed: {restore_result['error']}")
+        else:
+            log_structured("INFO", "startup", "Database restored from backup",
+                           restored_from=restore_result.get("restored_from"))
+            write_notification("info", "Database Restored",
+                               f"Restored from: {restore_result.get('restored_from')}")
+    elif integrity["status"] == "ok":
+        log_structured("INFO", "startup", "Database integrity OK",
+                       size_bytes=integrity.get("size_bytes"))
+
     last_heartbeat = 0
     last_watchdog = 0
+    last_maintenance = 0
     cycle_count = 0
     consecutive_failures = 0
     total_cycles = 0
@@ -367,6 +389,21 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
                 write_notification("critical", "Heartbeat Crash",
                                    f"Cycle #{cycle_count} crashed: {e}")
             last_heartbeat = now
+
+        # Daily maintenance: backup, prune, rotate (every 24h)
+        if now - last_maintenance >= 86400:
+            try:
+                log_structured("INFO", "maintenance", "Running daily maintenance")
+                maint = backup.run_maintenance()
+                pruned = maint.get("pruned", {})
+                log_structured("INFO", "maintenance", "Maintenance complete",
+                               health_logs_pruned=pruned.get("health_logs", 0),
+                               tasks_pruned=pruned.get("tasks", 0),
+                               goals_pruned=pruned.get("goals", 0),
+                               backups_rotated=maint.get("rotation", {}).get("deleted", 0))
+            except Exception as e:
+                log_structured("ERROR", "maintenance", f"Maintenance failed: {e}")
+            last_maintenance = now
 
         # Sleep in small increments so we can respond to Ctrl+C
         time.sleep(1)
