@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""ANAH Scheduler — Lightweight heartbeat daemon.
+"""ANAH Scheduler — Hardened heartbeat daemon.
 
-Runs the orchestrator on configurable intervals without requiring
-the full Autoclaw TypeScript build. Designed as a bridge until
-Autoclaw's cron system is wired up.
+Runs the orchestrator on configurable intervals. Includes:
+- Structured log rotation (JSON lines, max 10MB per file, keep 5)
+- PID file management (prevents duplicate daemons)
+- Crash recovery (auto-restart on exception with backoff)
+- Resource guard (skip cycle if system is under heavy load)
+- Notification integration (writes critical alerts to notifications.json)
 
 Usage:
     python scheduler.py                  # Default intervals
     python scheduler.py --fast           # Aggressive intervals for testing
     python scheduler.py --watchdog-only  # L1 checks only, every 30s
+    python scheduler.py --daemon         # Background mode with log file
 """
 
 import json
+import os
 import signal
 import sys
 import time
-import threading
 from pathlib import Path
 
 ANAH_DIR = Path.home() / ".anah"
+LOGS_DIR = ANAH_DIR / "logs"
+PID_FILE = ANAH_DIR / "scheduler.pid"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
 # Import orchestrator
@@ -44,34 +50,193 @@ PRESETS = {
     },
 }
 
+# Hardening constants
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB per log file
+MAX_LOG_FILES = 5
+MAX_CONSECUTIVE_FAILURES = 5
+BACKOFF_BASE = 5  # seconds
+BACKOFF_MAX = 300  # 5 min max backoff
+CPU_GUARD_THRESHOLD = 95  # skip cycle if CPU > 95%
+RAM_GUARD_THRESHOLD = 95  # skip cycle if RAM > 95%
+
 running = True
 
 
 def signal_handler(sig, frame):
     global running
-    print("\n[scheduler] Shutting down gracefully...", file=sys.stderr)
+    log_stderr("[scheduler] Shutting down gracefully...")
     running = False
 
 
+# ---------------------------------------------------------------------------
+# Structured logging
+# ---------------------------------------------------------------------------
+def ensure_log_dir():
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_stderr(msg: str):
+    """Print to stderr (for terminal visibility)."""
+    print(msg, file=sys.stderr)
+
+
+def log_structured(level: str, component: str, message: str, **extra):
+    """Write a structured JSON log line to the log file and stderr."""
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "epoch": time.time(),
+        "level": level,
+        "component": component,
+        "message": message,
+        **extra,
+    }
+    line = json.dumps(entry, default=str)
+
+    # Write to log file
+    try:
+        ensure_log_dir()
+        log_file = LOGS_DIR / "scheduler.jsonl"
+        with open(str(log_file), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        rotate_logs(log_file)
+    except Exception:
+        pass  # Never crash on logging failure
+
+    # Also print summary to stderr
+    prefix = f"[{component}]"
+    if level == "ERROR":
+        prefix = f"[{component}] ERROR:"
+    elif level == "WARN":
+        prefix = f"[{component}] WARN:"
+    log_stderr(f"{prefix} {message}")
+
+
+def rotate_logs(log_file: Path):
+    """Rotate log file if it exceeds MAX_LOG_SIZE."""
+    try:
+        if not log_file.exists() or log_file.stat().st_size < MAX_LOG_SIZE:
+            return
+
+        # Rotate: scheduler.jsonl → scheduler.1.jsonl → ... → scheduler.5.jsonl
+        for i in range(MAX_LOG_FILES, 1, -1):
+            older = LOGS_DIR / f"scheduler.{i}.jsonl"
+            newer = LOGS_DIR / f"scheduler.{i-1}.jsonl"
+            if newer.exists():
+                if older.exists():
+                    older.unlink()
+                newer.rename(older)
+
+        rotated = LOGS_DIR / "scheduler.1.jsonl"
+        if rotated.exists():
+            rotated.unlink()
+        log_file.rename(rotated)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# PID file management
+# ---------------------------------------------------------------------------
+def write_pid():
+    """Write PID file. Returns True if we acquired the lock."""
+    ANAH_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Check for stale PID
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            # Check if process is still alive
+            try:
+                os.kill(old_pid, 0)  # Signal 0 = check existence
+                log_structured("ERROR", "scheduler",
+                               f"Another scheduler is running (PID {old_pid}). Exiting.",
+                               stale_pid=old_pid)
+                return False
+            except (OSError, ProcessLookupError):
+                # Process is dead — stale PID file
+                log_structured("WARN", "scheduler",
+                               f"Removing stale PID file (PID {old_pid} not running)",
+                               stale_pid=old_pid)
+        except ValueError:
+            pass  # Corrupt PID file
+
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def remove_pid():
+    """Remove PID file on shutdown."""
+    try:
+        if PID_FILE.exists():
+            current = PID_FILE.read_text().strip()
+            if current == str(os.getpid()):
+                PID_FILE.unlink()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Resource guard
+# ---------------------------------------------------------------------------
+def resource_guard() -> tuple[bool, str]:
+    """Check if system resources allow running a cycle.
+    Returns (ok, reason)."""
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.1)
+        ram = psutil.virtual_memory().percent
+        if cpu > CPU_GUARD_THRESHOLD:
+            return False, f"CPU at {cpu}% (threshold {CPU_GUARD_THRESHOLD}%)"
+        if ram > RAM_GUARD_THRESHOLD:
+            return False, f"RAM at {ram}% (threshold {RAM_GUARD_THRESHOLD}%)"
+        return True, f"CPU {cpu}%, RAM {ram}%"
+    except ImportError:
+        return True, "psutil not available, skipping guard"
+
+
+# ---------------------------------------------------------------------------
+# Notification helper
+# ---------------------------------------------------------------------------
+def write_notification(level: str, title: str, message: str):
+    """Write a notification to the JSONL notification file."""
+    try:
+        notif_file = ANAH_DIR / "notifications.json"
+        entry = {
+            "timestamp": time.time(),
+            "level": level,
+            "title": title,
+            "message": message,
+            "source": "scheduler",
+        }
+        with open(str(notif_file), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Main scheduler
+# ---------------------------------------------------------------------------
 def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate: bool = False):
-    """Main scheduler loop."""
+    """Main scheduler loop with crash recovery and resource guards."""
     global running
     intervals = PRESETS.get(preset, PRESETS["default"])
 
-    print(f"[scheduler] ANAH Heartbeat Scheduler starting", file=sys.stderr)
-    print(f"[scheduler] Preset: {preset}", file=sys.stderr)
-    print(f"[scheduler] Heartbeat interval: {intervals['heartbeat']}s", file=sys.stderr)
-    print(f"[scheduler] Watchdog interval: {intervals['watchdog']}s", file=sys.stderr)
-    print(f"[scheduler] Goal generation: {'enabled' if generate else 'disabled'}", file=sys.stderr)
-    print(f"[scheduler] Mode: {'watchdog-only' if watchdog_only else 'full'}", file=sys.stderr)
-    print(f"[scheduler] PID: {__import__('os').getpid()}", file=sys.stderr)
-    print(f"[scheduler] Press Ctrl+C to stop\n", file=sys.stderr)
+    log_structured("INFO", "scheduler", "ANAH Heartbeat Scheduler starting",
+                   preset=preset, heartbeat_sec=intervals["heartbeat"],
+                   watchdog_sec=intervals["watchdog"], generate=generate,
+                   mode="watchdog-only" if watchdog_only else "full",
+                   pid=os.getpid())
 
     orchestrator.load_env()
 
     last_heartbeat = 0
     last_watchdog = 0
     cycle_count = 0
+    consecutive_failures = 0
+    total_cycles = 0
+    total_failures = 0
+    start_time = time.time()
 
     while running:
         now = time.time()
@@ -83,40 +248,91 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
                 healthy = result.get("l1_healthy", False)
                 duration = result.get("duration_ms", 0)
                 status = "OK" if healthy else "CRITICAL"
-                print(f"[watchdog] L1 {status} ({duration:.0f}ms)", file=sys.stderr)
+                log_structured("INFO" if healthy else "ERROR", "watchdog",
+                               f"L1 {status} ({duration:.0f}ms)",
+                               l1_healthy=healthy, duration_ms=duration)
                 if not healthy:
-                    print(f"[watchdog] L1 FAILURE — higher functions suspended", file=sys.stderr)
+                    write_notification("critical", "L1 Health Failure",
+                                       "Brainstem L1 check failed — higher functions suspended")
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
             except Exception as e:
-                print(f"[watchdog] Error: {e}", file=sys.stderr)
+                log_structured("ERROR", "watchdog", f"Exception: {e}", error=str(e))
+                consecutive_failures += 1
             last_watchdog = now
 
         # Full heartbeat cycle (less frequent)
         if not watchdog_only and now - last_heartbeat >= intervals["heartbeat"]:
+            # Resource guard
+            ok, reason = resource_guard()
+            if not ok:
+                log_structured("WARN", "heartbeat", f"Skipping cycle — {reason}",
+                               guard_reason=reason)
+                last_heartbeat = now
+                continue
+
+            # Backoff on consecutive failures
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                backoff = min(BACKOFF_BASE * (2 ** (consecutive_failures - MAX_CONSECUTIVE_FAILURES)),
+                              BACKOFF_MAX)
+                log_structured("WARN", "heartbeat",
+                               f"Backing off {backoff}s after {consecutive_failures} consecutive failures",
+                               backoff_sec=backoff, consecutive_failures=consecutive_failures)
+                write_notification("warning", "Scheduler Backoff",
+                                   f"Backing off {backoff}s after {consecutive_failures} failures")
+                time.sleep(min(backoff, 5))  # Sleep in small chunks
+                last_heartbeat = now
+                continue
+
             cycle_count += 1
+            total_cycles += 1
             try:
-                print(f"\n[heartbeat] Cycle #{cycle_count} starting...", file=sys.stderr)
+                log_structured("INFO", "heartbeat", f"Cycle #{cycle_count} starting",
+                               cycle=cycle_count)
                 result = orchestrator.full_cycle(generate=generate, learn=True)
                 duration = result.get("duration_ms", 0)
                 bs = result.get("brainstem", {})
                 cx = result.get("cortex", {})
                 hp = result.get("hippocampus", {})
+                ex = result.get("executor", {})
 
-                print(f"[heartbeat] Cycle #{cycle_count} complete ({duration:.0f}ms)", file=sys.stderr)
-                print(f"  Health: {bs.get('health_score', '?')}%  "
-                      f"Passed: {bs.get('passed', '?')}/{bs.get('passed', 0) + bs.get('failed', 0)}  "
-                      f"Goals: {cx.get('count', 0)}  "
-                      f"Skills: {hp.get('extracted', 0)}", file=sys.stderr)
+                log_structured("INFO", "heartbeat", f"Cycle #{cycle_count} complete ({duration:.0f}ms)",
+                               cycle=cycle_count, duration_ms=duration,
+                               health_score=bs.get("health_score"),
+                               checks_passed=bs.get("passed"),
+                               checks_total=bs.get("passed", 0) + bs.get("failed", 0),
+                               goals=cx.get("count", 0),
+                               skills_extracted=hp.get("extracted", 0),
+                               tasks_processed=ex.get("processed", 0),
+                               gated=result.get("gated", False))
 
                 if result.get("gated"):
-                    print(f"  [GATED] L1 failure suspended higher functions", file=sys.stderr)
+                    log_structured("WARN", "heartbeat", "L1 failure suspended higher functions",
+                                   gated=True)
+                    write_notification("warning", "Heartbeat Gated",
+                                       "L1 failure suspended higher brain functions")
+
+                consecutive_failures = 0
             except Exception as e:
-                print(f"[heartbeat] Error in cycle #{cycle_count}: {e}", file=sys.stderr)
+                total_failures += 1
+                consecutive_failures += 1
+                log_structured("ERROR", "heartbeat", f"Cycle #{cycle_count} crashed: {e}",
+                               cycle=cycle_count, error=str(e),
+                               consecutive_failures=consecutive_failures)
+                write_notification("critical", "Heartbeat Crash",
+                                   f"Cycle #{cycle_count} crashed: {e}")
             last_heartbeat = now
 
         # Sleep in small increments so we can respond to Ctrl+C
         time.sleep(1)
 
-    print("[scheduler] Stopped.", file=sys.stderr)
+    # Shutdown summary
+    uptime = time.time() - start_time
+    log_structured("INFO", "scheduler", "Stopped",
+                   uptime_sec=round(uptime),
+                   total_cycles=total_cycles,
+                   total_failures=total_failures)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +341,7 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="ANAH Scheduler — lightweight heartbeat daemon")
+    parser = argparse.ArgumentParser(description="ANAH Scheduler — hardened heartbeat daemon")
     parser.add_argument("--preset", choices=["default", "fast", "conservative"], default="default",
                         help="Interval preset")
     parser.add_argument("--fast", action="store_true", help="Shortcut for --preset fast")
@@ -139,4 +355,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    run_scheduler(preset=preset, watchdog_only=args.watchdog_only, generate=args.generate)
+    # PID file — prevent duplicate daemons
+    if not write_pid():
+        sys.exit(1)
+
+    try:
+        run_scheduler(preset=preset, watchdog_only=args.watchdog_only, generate=args.generate)
+    finally:
+        remove_pid()

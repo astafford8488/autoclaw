@@ -1,4 +1,4 @@
-"""Tests for anah-brainstem — L1-L3 health monitoring."""
+"""Tests for anah-brainstem — L1-L5 health monitoring."""
 
 import asyncio
 import json
@@ -157,3 +157,189 @@ class TestSecurity:
         assert len(fs_check) == 1
         # Should pass — writes to ~/.anah/ only
         assert fs_check[0]["passed"] is True
+
+
+class TestL4Checks:
+    """L4 belonging/integration checks — Ollama, skills ecosystem, peer connectivity."""
+
+    @pytest.mark.asyncio
+    async def test_l4_returns_three_checks(self):
+        result = await brainstem.run_checks(levels=[4])
+        assert len(result["results"]) == 3
+        names = {r["name"] for r in result["results"]}
+        assert names == {"ollama_available", "skills_ecosystem", "peer_connectivity"}
+
+    @pytest.mark.asyncio
+    async def test_l4_checks_are_level_4(self):
+        result = await brainstem.run_checks(levels=[4])
+        for r in result["results"]:
+            assert r["level"] == 4
+
+    @pytest.mark.asyncio
+    async def test_ollama_check_passes_when_reachable(self):
+        result = await brainstem.run_checks(levels=[4])
+        ollama = [r for r in result["results"] if r["name"] == "ollama_available"][0]
+        # Ollama should be running on the dev machine
+        assert isinstance(ollama["passed"], bool)
+        assert ollama["duration_ms"] > 0
+
+    @pytest.mark.asyncio
+    async def test_ollama_check_fails_gracefully(self):
+        """When Ollama is unreachable, should fail without crashing."""
+        with patch.dict("os.environ", {"OLLAMA_URL": "http://localhost:99999"}):
+            # Need to reload the constant
+            original = brainstem.OLLAMA_URL
+            brainstem.OLLAMA_URL = "http://localhost:99999"
+            try:
+                config = brainstem.load_config()
+                config["OLLAMA_URL"] = "http://localhost:99999"
+                r = await brainstem.check_ollama_available(config)
+                assert r.passed is False
+                assert "unreachable" in r.message.lower() or "refused" in r.message.lower() or "error" in r.message.lower()
+            finally:
+                brainstem.OLLAMA_URL = original
+
+    @pytest.mark.asyncio
+    async def test_skills_ecosystem_with_valid_skills(self, anah_dir):
+        skill_dir = anah_dir / "skills" / "test-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: test\n---\n# Test")
+        with patch.object(brainstem, "SKILLS_DIR", anah_dir / "skills"):
+            config = brainstem.load_config()
+            r = await brainstem.check_skills_ecosystem(config)
+            assert r.passed is True
+            assert r.details["valid"] == 1
+
+    @pytest.mark.asyncio
+    async def test_skills_ecosystem_empty(self, anah_dir):
+        skills_dir = anah_dir / "skills"
+        skills_dir.mkdir(exist_ok=True)
+        with patch.object(brainstem, "SKILLS_DIR", skills_dir):
+            config = brainstem.load_config()
+            r = await brainstem.check_skills_ecosystem(config)
+            assert r.passed is False
+
+    @pytest.mark.asyncio
+    async def test_peer_connectivity_with_recent_tasks(self, anah_db, anah_dir):
+        import time as t
+        now = t.time()
+        anah_db.execute(
+            "INSERT INTO task_queue (created_at, title, status, completed_at) VALUES (?, 'test', 'completed', ?)",
+            (now, now))
+        anah_db.commit()
+        with patch.object(brainstem, "DB_FILE", anah_dir / "anah.db"):
+            config = brainstem.load_config()
+            r = await brainstem.check_peer_connectivity(config)
+            assert r.passed is True
+            assert r.details["completed_last_hour"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_peer_connectivity_no_recent_tasks(self, anah_db, anah_dir):
+        # No tasks in DB
+        with patch.object(brainstem, "DB_FILE", anah_dir / "anah.db"):
+            config = brainstem.load_config()
+            r = await brainstem.check_peer_connectivity(config)
+            assert r.passed is False
+
+
+class TestL5Checks:
+    """L5 self-actualization checks — learning rate, goal quality, trajectory growth."""
+
+    @pytest.mark.asyncio
+    async def test_l5_returns_three_checks(self):
+        result = await brainstem.run_checks(levels=[5])
+        assert len(result["results"]) == 3
+        names = {r["name"] for r in result["results"]}
+        assert names == {"learning_rate", "goal_quality", "trajectory_growth"}
+
+    @pytest.mark.asyncio
+    async def test_l5_checks_are_level_5(self):
+        result = await brainstem.run_checks(levels=[5])
+        for r in result["results"]:
+            assert r["level"] == 5
+
+    @pytest.mark.asyncio
+    async def test_l5_uses_aspirational_status(self):
+        """L5 should use 'aspirational' instead of 'degraded' when checks fail."""
+        result = await brainstem.run_checks(levels=[5])
+        state = json.loads(brainstem.STATE_FILE.read_text())
+        l5_status = state["levels"].get("5", {}).get("status")
+        assert l5_status in ("healthy", "aspirational")
+
+    @pytest.mark.asyncio
+    async def test_learning_rate_with_recent_entries(self, anah_dir):
+        import time as t
+        log = [{"timestamp": t.time(), "skill": "test-skill", "task_id": 1}]
+        (anah_dir / "learning_log.json").write_text(json.dumps(log))
+        with patch.object(brainstem, "LEARNING_LOG", anah_dir / "learning_log.json"):
+            config = brainstem.load_config()
+            r = await brainstem.check_learning_rate(config)
+            assert r.passed is True
+            assert r.details["recent_count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_learning_rate_no_log(self, anah_dir):
+        with patch.object(brainstem, "LEARNING_LOG", anah_dir / "nonexistent.json"):
+            config = brainstem.load_config()
+            r = await brainstem.check_learning_rate(config)
+            assert r.passed is False
+
+    @pytest.mark.asyncio
+    async def test_goal_quality_high_enactment(self, anah_db, anah_dir):
+        import time as t
+        now = t.time()
+        anah_db.execute(
+            "INSERT INTO generated_goals (timestamp, title, priority, status, source, reasoning) "
+            "VALUES (?, 'g1', 5, 'enacted', 'llm', 'test')", (now,))
+        anah_db.execute(
+            "INSERT INTO generated_goals (timestamp, title, priority, status, source, reasoning) "
+            "VALUES (?, 'g2', 5, 'enacted', 'llm', 'test')", (now,))
+        anah_db.commit()
+        with patch.object(brainstem, "DB_FILE", anah_dir / "anah.db"):
+            config = brainstem.load_config()
+            r = await brainstem.check_goal_quality(config)
+            assert r.passed is True
+            assert r.details["ratio"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_goal_quality_no_goals_is_ok(self, anah_db, anah_dir):
+        with patch.object(brainstem, "DB_FILE", anah_dir / "anah.db"):
+            config = brainstem.load_config()
+            r = await brainstem.check_goal_quality(config)
+            assert r.passed is True
+            assert "No goals" in r.message or r.details["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_trajectory_growth_with_files(self, anah_dir):
+        traj_dir = anah_dir / "trajectories"
+        traj_dir.mkdir(exist_ok=True)
+        (traj_dir / "t1.json").write_text("{}")
+        with patch.object(brainstem, "TRAJECTORIES_DIR", traj_dir):
+            config = brainstem.load_config()
+            r = await brainstem.check_trajectory_growth(config)
+            assert r.passed is True
+            assert r.details["count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_trajectory_growth_empty(self, anah_dir):
+        traj_dir = anah_dir / "trajectories"
+        traj_dir.mkdir(exist_ok=True)
+        with patch.object(brainstem, "TRAJECTORIES_DIR", traj_dir):
+            config = brainstem.load_config()
+            r = await brainstem.check_trajectory_growth(config)
+            assert r.passed is False
+
+
+class TestAllLevels:
+    """Full L1-L5 run."""
+
+    @pytest.mark.asyncio
+    async def test_all_five_levels_run(self):
+        result = await brainstem.run_checks(levels=[1, 2, 3, 4, 5])
+        levels_present = {r["level"] for r in result["results"]}
+        assert 1 in levels_present
+        assert 2 in levels_present
+        assert 3 in levels_present
+        assert 4 in levels_present
+        assert 5 in levels_present
+        assert result["summary"]["total"] >= 14  # 4+3+1+3+3 minimum

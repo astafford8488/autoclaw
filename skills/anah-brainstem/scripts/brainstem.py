@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ANAH Brainstem — L1-L3 autonomic health checks.
+"""ANAH Brainstem — L1-L5 autonomic health checks.
 
 Runs without LLM involvement. Pure signal monitoring.
 Outputs JSON results to stdout and persists state to ~/.anah/state.json.
@@ -24,6 +24,10 @@ STATE_FILE = ANAH_DIR / "state.json"
 CONFIG_FILE = ANAH_DIR / "config.json"
 DB_FILE = ANAH_DIR / "anah.db"
 BACKUP_DIR = ANAH_DIR / "backups"
+SKILLS_DIR = ANAH_DIR / "skills"
+LEARNING_LOG = ANAH_DIR / "learning_log.json"
+TRAJECTORIES_DIR = ANAH_DIR / "trajectories"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 
 def ensure_dirs():
@@ -287,6 +291,166 @@ async def run_l3(config: dict) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# L4 — Belonging / Integration
+# ---------------------------------------------------------------------------
+async def check_ollama_available(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        import urllib.request
+        url = config.get("OLLAMA_URL", OLLAMA_URL)
+        req = urllib.request.Request(f"{url}/api/tags", method="GET")
+        timeout = config.get("thresholds", {}).get("api_ping_timeout_sec", 10)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("ollama_available", 4, True, ms, f"Ollama API reachable ({resp.status})")
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("ollama_available", 4, False, ms, f"Ollama unreachable: {e}")
+
+
+async def check_skills_ecosystem(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        if not SKILLS_DIR.exists():
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("skills_ecosystem", 4, False, ms, "Skills directory does not exist", {"skills_dir": str(SKILLS_DIR)})
+        skill_dirs = [d for d in SKILLS_DIR.iterdir() if d.is_dir()]
+        if len(skill_dirs) == 0:
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("skills_ecosystem", 4, False, ms, "No learned skills found", {"count": 0})
+        # Validate SKILL.md frontmatter
+        valid = 0
+        invalid = []
+        for sd in skill_dirs:
+            skill_md = sd / "SKILL.md"
+            if skill_md.exists():
+                content = skill_md.read_text(encoding="utf-8", errors="replace")
+                if content.strip().startswith("---"):
+                    valid += 1
+                else:
+                    invalid.append(sd.name)
+            else:
+                invalid.append(sd.name)
+        ms = (time.monotonic() - start) * 1000
+        passed = valid >= 1
+        msg = f"{valid} valid skill(s), {len(invalid)} invalid" if invalid else f"{valid} valid skill(s)"
+        return CheckResult("skills_ecosystem", 4, passed, ms, msg, {"valid": valid, "invalid": invalid, "total": len(skill_dirs)})
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("skills_ecosystem", 4, False, ms, f"Skills check failed: {e}")
+
+
+async def check_peer_connectivity(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        if not DB_FILE.exists():
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("peer_connectivity", 4, True, ms, "No database yet (no tasks to check)")
+        import sqlite3
+        conn = sqlite3.connect(str(DB_FILE))
+        cutoff = time.time() - 3600  # last hour
+        row = conn.execute(
+            "SELECT COUNT(*) FROM task_queue WHERE status = 'completed' AND completed_at > ?",
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        count = row[0] if row else 0
+        ms = (time.monotonic() - start) * 1000
+        passed = count > 0
+        msg = f"{count} task(s) completed in last hour" if passed else "No tasks completed in last hour"
+        return CheckResult("peer_connectivity", 4, passed, ms, msg, {"completed_last_hour": count})
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("peer_connectivity", 4, False, ms, f"Peer connectivity check failed: {e}")
+
+
+async def run_l4(config: dict) -> list[CheckResult]:
+    return list(await asyncio.gather(
+        check_ollama_available(config),
+        check_skills_ecosystem(config),
+        check_peer_connectivity(config),
+    ))
+
+
+# ---------------------------------------------------------------------------
+# L5 — Self-Actualization
+# ---------------------------------------------------------------------------
+async def check_learning_rate(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        if not LEARNING_LOG.exists():
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("learning_rate", 5, False, ms, "No learning_log.json found", {"exists": False})
+        data = json.loads(LEARNING_LOG.read_text())
+        if not isinstance(data, list):
+            data = data.get("entries", []) if isinstance(data, dict) else []
+        cutoff = time.time() - 86400  # 24 hours
+        recent = [e for e in data if e.get("timestamp", 0) > cutoff]
+        ms = (time.monotonic() - start) * 1000
+        passed = len(recent) > 0
+        msg = f"{len(recent)} skill(s) learned in last 24h" if passed else "No skills learned in last 24h"
+        return CheckResult("learning_rate", 5, passed, ms, msg, {"recent_count": len(recent), "total": len(data)})
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("learning_rate", 5, False, ms, f"Learning rate check failed: {e}")
+
+
+async def check_goal_quality(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        if not DB_FILE.exists():
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("goal_quality", 5, True, ms, "No database yet (no goals to evaluate)")
+        import sqlite3
+        conn = sqlite3.connect(str(DB_FILE))
+        cutoff = time.time() - 86400  # 24 hours
+        total_row = conn.execute(
+            "SELECT COUNT(*) FROM generated_goals WHERE timestamp > ?", (cutoff,)
+        ).fetchone()
+        enacted_row = conn.execute(
+            "SELECT COUNT(*) FROM generated_goals WHERE timestamp > ? AND status = 'enacted'", (cutoff,)
+        ).fetchone()
+        conn.close()
+        total = total_row[0] if total_row else 0
+        enacted = enacted_row[0] if enacted_row else 0
+        ms = (time.monotonic() - start) * 1000
+        if total == 0:
+            return CheckResult("goal_quality", 5, True, ms, "No goals in last 24h (OK)", {"total": 0, "enacted": 0})
+        ratio = enacted / total
+        passed = ratio > 0.5
+        msg = f"{enacted}/{total} goals enacted ({ratio:.0%})"
+        return CheckResult("goal_quality", 5, passed, ms, msg, {"total": total, "enacted": enacted, "ratio": round(ratio, 3)})
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("goal_quality", 5, False, ms, f"Goal quality check failed: {e}")
+
+
+async def check_trajectory_growth(config: dict) -> CheckResult:
+    start = time.monotonic()
+    try:
+        if not TRAJECTORIES_DIR.exists():
+            ms = (time.monotonic() - start) * 1000
+            return CheckResult("trajectory_growth", 5, False, ms, "Trajectories directory does not exist", {"trajectories_dir": str(TRAJECTORIES_DIR)})
+        trajectories = list(TRAJECTORIES_DIR.iterdir())
+        count = len(trajectories)
+        ms = (time.monotonic() - start) * 1000
+        passed = count > 0
+        msg = f"{count} trajectory(ies) accumulated" if passed else "No trajectories yet"
+        return CheckResult("trajectory_growth", 5, passed, ms, msg, {"count": count})
+    except Exception as e:
+        ms = (time.monotonic() - start) * 1000
+        return CheckResult("trajectory_growth", 5, False, ms, f"Trajectory growth check failed: {e}")
+
+
+async def run_l5(config: dict) -> list[CheckResult]:
+    return list(await asyncio.gather(
+        check_learning_rate(config),
+        check_goal_quality(config),
+        check_trajectory_growth(config),
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 def load_state() -> dict:
@@ -305,7 +469,7 @@ async def run_checks(levels: list[int] | None = None) -> dict:
     state = load_state()
 
     if levels is None:
-        levels = [1, 2, 3]
+        levels = [1, 2, 3, 4, 5]
 
     all_results = []
 
@@ -349,6 +513,26 @@ async def run_checks(levels: list[int] | None = None) -> dict:
             "checks": [asdict(r) for r in l3_results],
         }
 
+    if 4 in levels:
+        l4_results = await run_l4(config)
+        all_results.extend(l4_results)
+        l4_healthy = all(r.passed for r in l4_results)
+        state["levels"]["4"] = {
+            "status": "healthy" if l4_healthy else "degraded",
+            "last_check": time.time(),
+            "checks": [asdict(r) for r in l4_results],
+        }
+
+    if 5 in levels:
+        l5_results = await run_l5(config)
+        all_results.extend(l5_results)
+        l5_healthy = all(r.passed for r in l5_results)
+        state["levels"]["5"] = {
+            "status": "healthy" if l5_healthy else "aspirational",
+            "last_check": time.time(),
+            "checks": [asdict(r) for r in l5_results],
+        }
+
     state["last_update"] = time.time()
     save_state(state)
 
@@ -369,13 +553,13 @@ async def run_checks(levels: list[int] | None = None) -> dict:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="ANAH Brainstem — L1-L3 health checks")
-    parser.add_argument("--level", "-l", type=int, choices=[1, 2, 3], help="Run a specific level only")
+    parser = argparse.ArgumentParser(description="ANAH Brainstem — L1-L5 health checks")
+    parser.add_argument("--level", "-l", type=int, choices=[1, 2, 3, 4, 5], help="Run a specific level only")
     parser.add_argument("--all", "-a", action="store_true", help="Run all levels")
     parser.add_argument("--compact", action="store_true", help="Compact JSON output")
     args = parser.parse_args()
 
-    levels = [args.level] if args.level else [1, 2, 3]
+    levels = [args.level] if args.level else [1, 2, 3, 4, 5]
     result = asyncio.run(run_checks(levels))
 
     indent = None if args.compact else 2

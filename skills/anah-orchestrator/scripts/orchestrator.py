@@ -118,13 +118,14 @@ def full_cycle(generate: bool = True, execute: bool = True, learn: bool = True) 
     result = {"timestamp": t0, "cycle": "full"}
 
     # 1. Brainstem — all levels
-    print("[brainstem] Running L1-L3 health checks...", file=sys.stderr)
+    print("[brainstem] Running L1-L5 health checks...", file=sys.stderr)
     brainstem_out = run_brainstem()
     result["brainstem"] = {
         "health_score": brainstem_out["summary"]["health_score"],
         "passed": brainstem_out["summary"]["passed"],
         "failed": brainstem_out["summary"]["failed"],
         "l1_healthy": brainstem_out["gating"]["l1_healthy"],
+        "levels_checked": brainstem_out["summary"]["total"],
     }
 
     # Gate: if L1 failed, skip higher functions
@@ -214,6 +215,18 @@ def status_overview() -> dict:
         result["hippocampus"] = {"learned_skills": len(skills)}
     except Exception:
         result["hippocampus"] = {"learned_skills": 0}
+
+    # Level status summary from state
+    try:
+        state_file = ANAH_DIR / "state.json"
+        if state_file.exists():
+            state = json.loads(state_file.read_text())
+            result["levels"] = {
+                f"L{k}": v.get("status", "unknown")
+                for k, v in state.get("levels", {}).items()
+            }
+    except Exception:
+        pass
 
     return result
 

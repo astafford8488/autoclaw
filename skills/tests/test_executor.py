@@ -335,3 +335,338 @@ class TestSecurity:
         executor.complete_task(anah_db, 1, evil_result)
         count = anah_db.execute("SELECT COUNT(*) FROM task_queue").fetchone()[0]
         assert count == 1
+
+
+# =========================================================================
+# New handler routing tests
+# =========================================================================
+class TestNewRouting:
+    """Routing for the 6 new handlers."""
+
+    def test_route_file_ops_archive(self):
+        assert executor.route_task({"title": "archive old trajectories"}) == "file_ops"
+
+    def test_route_file_ops_list(self):
+        assert executor.route_task({"title": "list files in anah"}) == "file_ops"
+
+    def test_route_web_research(self):
+        assert executor.route_task({"title": "research best practices"}) == "web_research"
+
+    def test_route_web_research_url(self):
+        assert executor.route_task({"title": "fetch url content"}) == "web_research"
+
+    def test_route_code_gen(self):
+        assert executor.route_task({"title": "generate code for monitoring"}) == "code_gen"
+
+    def test_route_code_gen_write_script(self):
+        assert executor.route_task({"title": "write script for backup"}) == "code_gen"
+
+    def test_route_notify(self):
+        assert executor.route_task({"title": "notify: system update"}) == "notify"
+
+    def test_route_notify_alert(self):
+        assert executor.route_task({"title": "alert: disk space low"}) == "notify"
+
+    def test_route_schedule(self):
+        assert executor.route_task({"title": "set heartbeat 120"}) == "schedule"
+
+    def test_route_schedule_preset(self):
+        assert executor.route_task({"title": "set watchdog 30"}) == "schedule"
+
+    def test_route_skill_install(self):
+        assert executor.route_task({"title": "install skill for monitoring"}) == "skill_install"
+
+    def test_route_skill_install_learn(self):
+        assert executor.route_task({"title": "learn skill for backup"}) == "skill_install"
+
+
+# =========================================================================
+# File ops handler tests
+# =========================================================================
+class TestFileOpsHandler:
+    """File operations handler."""
+
+    def test_list_operation(self, anah_dir):
+        (anah_dir / "skills").mkdir(exist_ok=True)
+        (anah_dir / "trajectories").mkdir(exist_ok=True)
+        (anah_dir / "backups").mkdir(exist_ok=True)
+        (anah_dir / "trajectories" / "t1.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_file_ops({"title": "list files", "description": "list"})
+        assert result.success is True
+        assert result.result["operation"] == "list"
+        assert "trajectories" in result.result["dirs"]
+        assert result.result["dirs"]["trajectories"]["files"] == 1
+
+    def test_summarize_operation(self, anah_dir):
+        (anah_dir / "state.json").write_text('{"levels": {}, "gating": {}}')
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_file_ops({"title": "summarize state", "description": "summarize"})
+        assert result.success is True
+        assert result.result["operation"] == "summarize"
+        assert "state.json" in result.result["summary"]
+
+    def test_archive_operation_empty(self, anah_dir):
+        (anah_dir / "trajectories").mkdir(exist_ok=True)
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_file_ops({"title": "archive old", "description": "archive trajectories"})
+        assert result.success is True
+        assert result.result["operation"] == "archive"
+        assert result.result["archived"] == 0
+
+    def test_unknown_operation_fails(self):
+        result = executor.handle_file_ops({"title": "file: do something weird", "description": "blorp"})
+        assert result.success is False
+
+
+# =========================================================================
+# Web research handler tests
+# =========================================================================
+class TestWebResearchHandler:
+    """Web research handler."""
+
+    def test_blocks_localhost(self):
+        result = executor.handle_web_research({
+            "title": "research", "description": "fetch http://localhost:8080/secret"
+        })
+        assert result.success is False
+        assert "Blocked" in result.result.get("error", "")
+
+    def test_blocks_private_ip_10(self):
+        result = executor.handle_web_research({
+            "title": "research", "description": "fetch http://10.0.0.1/admin"
+        })
+        assert result.success is False
+
+    def test_blocks_private_ip_192(self):
+        result = executor.handle_web_research({
+            "title": "research", "description": "fetch http://192.168.1.1/config"
+        })
+        assert result.success is False
+
+    def test_blocks_private_ip_172(self):
+        result = executor.handle_web_research({
+            "title": "research", "description": "fetch http://172.16.0.1/internal"
+        })
+        assert result.success is False
+
+    def test_blocks_file_url(self):
+        """file:// URLs aren't matched by the https? regex, so they fall to Ollama (safe)."""
+        with patch.object(executor, "handle_ollama") as mock_ollama:
+            mock_ollama.return_value = executor.TaskResult(True, {"handler": "ollama"}, 100)
+            result = executor.handle_web_research({
+                "title": "research", "description": "fetch file:///etc/passwd"
+            })
+        # file:// never gets fetched — it falls through to Ollama
+        mock_ollama.assert_called_once()
+
+    def test_no_url_falls_back_to_ollama(self):
+        with patch.object(executor, "handle_ollama") as mock_ollama:
+            mock_ollama.return_value = executor.TaskResult(True, {"handler": "ollama"}, 100)
+            result = executor.handle_web_research({
+                "title": "research", "description": "best practices for agent design"
+            })
+        mock_ollama.assert_called_once()
+
+    def test_successful_fetch(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"<html><body>Hello World</body></html>"
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = executor.handle_web_research({
+                "title": "research", "description": "fetch https://example.com/page"
+            })
+        assert result.success is True
+        assert result.result["url"] == "https://example.com/page"
+        assert "Hello World" in result.result["excerpt"]
+
+
+# =========================================================================
+# Code gen handler tests
+# =========================================================================
+class TestCodeGenHandler:
+    """Code generation handler."""
+
+    def test_code_gen_saves_file(self, anah_dir):
+        mock_data = {"message": {"content": "```python\nprint('hello')\n```"}}
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_data).encode()
+        with patch("urllib.request.urlopen", return_value=mock_resp), \
+             patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_code_gen({
+                "title": "generate code test", "description": "print hello"
+            })
+        assert result.success is True
+        assert result.result["handler"] == "code_gen"
+        assert result.result["lines"] >= 1
+        # Verify file was created
+        gen_dir = anah_dir / "generated"
+        assert gen_dir.exists()
+        py_files = list(gen_dir.glob("*.py"))
+        assert len(py_files) == 1
+        assert "print('hello')" in py_files[0].read_text()
+
+    def test_code_gen_ollama_failure(self):
+        with patch("urllib.request.urlopen", side_effect=Exception("Connection refused")):
+            result = executor.handle_code_gen({
+                "title": "generate code", "description": "test"
+            })
+        assert result.success is False
+
+
+# =========================================================================
+# Notify handler tests
+# =========================================================================
+class TestNotifyHandler:
+    """Notification handler."""
+
+    def test_notify_info_level(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_notify({
+                "title": "notify: system ok", "description": "all systems green"
+            })
+        assert result.success is True
+        assert result.result["level"] == "info"
+        assert result.result["logged"] is True
+        # Check JSONL file
+        notif_file = anah_dir / "notifications.json"
+        assert notif_file.exists()
+        line = json.loads(notif_file.read_text().strip())
+        assert line["level"] == "info"
+
+    def test_notify_critical_level(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_notify({
+                "title": "notify:critical: disk full", "description": "95% used"
+            })
+        assert result.success is True
+        assert result.result["level"] == "critical"
+
+    def test_notify_warning_level(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_notify({
+                "title": "notify:warning: high cpu", "description": "80%"
+            })
+        assert result.success is True
+        assert result.result["level"] == "warning"
+
+
+# =========================================================================
+# Schedule handler tests
+# =========================================================================
+class TestScheduleHandler:
+    """Schedule management handler."""
+
+    def test_set_heartbeat(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set heartbeat 120"
+            })
+        assert result.success is True
+        assert result.result["updated"] == "heartbeat_interval"
+        assert result.result["value"] == 120
+        config = json.loads((anah_dir / "config.json").read_text())
+        assert config["heartbeat_interval"] == 120
+
+    def test_set_watchdog(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set watchdog 30"
+            })
+        assert result.success is True
+        assert result.result["updated"] == "watchdog_interval"
+        assert result.result["value"] == 30
+
+    def test_set_preset(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set preset fast"
+            })
+        assert result.success is True
+        assert result.result["updated"] == "preset"
+        assert result.result["value"] == "fast"
+
+    def test_heartbeat_range_validation_too_low(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set heartbeat 5"
+            })
+        assert result.success is False
+        assert "30-3600" in result.result["error"]
+
+    def test_heartbeat_range_validation_too_high(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set heartbeat 9999"
+            })
+        assert result.success is False
+
+    def test_watchdog_range_validation(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "set watchdog 5"
+            })
+        assert result.success is False
+        assert "10-600" in result.result["error"]
+
+    def test_unparseable_command(self, anah_dir):
+        (anah_dir / "config.json").write_text("{}")
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_schedule({
+                "title": "schedule", "description": "do something random"
+            })
+        assert result.success is False
+
+
+# =========================================================================
+# Skill install handler tests
+# =========================================================================
+class TestSkillInstallHandler:
+    """Skill installation handler."""
+
+    def test_install_creates_skill_dir(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_skill_install({
+                "title": "install skill", "description": "skill named log-analyzer for parsing logs"
+            })
+        assert result.success is True
+        assert result.result["handler"] == "skill_install"
+        skill_name = result.result["skill"]
+        skill_dir = anah_dir / "skills" / skill_name
+        assert skill_dir.exists()
+        assert (skill_dir / "SKILL.md").exists()
+
+    def test_skill_md_has_frontmatter(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_skill_install({
+                "title": "install skill", "description": "skill named test-skill for testing"
+            })
+        skill_name = result.result["skill"]
+        content = (anah_dir / "skills" / skill_name / "SKILL.md").read_text()
+        assert content.startswith("---")
+        assert "name:" in content
+
+    def test_skill_name_sanitization(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_skill_install({
+                "title": "install skill", "description": "skill named ../../etc/evil for hacking"
+            })
+        assert result.success is True
+        # Name should be sanitized — no path traversal
+        assert ".." not in result.result["skill"]
+        assert "/" not in result.result["skill"]
+
+    def test_skill_name_path_traversal_blocked(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_skill_install({
+                "title": "install skill", "description": "skill named ../../../tmp/evil for testing"
+            })
+        assert result.success is True
+        # Should be installed safely within ANAH_DIR/skills/
+        skill_path = Path(result.result["path"])
+        assert str(anah_dir) in str(skill_path)

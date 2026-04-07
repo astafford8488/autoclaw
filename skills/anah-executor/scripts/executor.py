@@ -7,9 +7,11 @@ Records results back to the database, closing the autonomous loop.
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -99,6 +101,8 @@ def queue_status(db: sqlite3.Connection) -> dict:
 def route_task(task: dict) -> str:
     """Determine which handler should process this task."""
     title = task["title"].lower()
+    desc = (task.get("description") or "").lower()
+    combined = title + " " + desc
 
     if title.startswith("health_report:") or title.startswith("system health report"):
         return "health_report"
@@ -108,6 +112,20 @@ def route_task(task: dict) -> str:
         return "cleanup"
     if title.startswith("echo:"):
         return "echo"
+
+    # New handlers — more specific patterns first
+    if any(kw in combined for kw in ("generate code", "write script", "code_gen", "create script")):
+        return "code_gen"
+    if any(kw in combined for kw in ("install skill", "skill_install", "add skill", "learn skill")):
+        return "skill_install"
+    if any(kw in combined for kw in ("set heartbeat", "set watchdog", "schedule", "interval")):
+        return "schedule"
+    if any(kw in combined for kw in ("notify", "alert", "notification")):
+        return "notify"
+    if any(kw in combined for kw in ("archive", "list files", "summarize state", "file")):
+        return "file_ops"
+    if any(kw in combined for kw in ("research", "fetch", "browse", "web", "url")):
+        return "web_research"
 
     # General-purpose tasks go to Ollama
     return "ollama"
@@ -254,6 +272,340 @@ def handle_cleanup(task: dict) -> TaskResult:
         return TaskResult(False, {"error": str(e), "handler": "cleanup"}, (time.time() - t0) * 1000)
 
 
+def handle_file_ops(task: dict) -> TaskResult:
+    """File operations within ~/.anah/ — archive, list, summarize."""
+    t0 = time.time()
+    try:
+        desc = (task.get("description") or task["title"]).lower()
+
+        if "archive" in desc:
+            # Zip old trajectories (>7 days)
+            traj_dir = ANAH_DIR / "trajectories"
+            archive_dir = ANAH_DIR / "archives"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            cutoff = time.time() - (7 * 86400)
+            archived = 0
+            if traj_dir.exists():
+                stamp = int(time.time())
+                zip_path = archive_dir / f"trajectories_{stamp}.zip"
+                with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in traj_dir.iterdir():
+                        resolved = f.resolve()
+                        if not resolved.is_relative_to(ANAH_DIR):
+                            continue
+                        if f.is_file() and f.stat().st_mtime < cutoff:
+                            zf.write(str(f), f.name)
+                            f.unlink()
+                            archived += 1
+            return TaskResult(True, {
+                "handler": "file_ops", "operation": "archive",
+                "archived": archived,
+                "zip": str(zip_path) if archived else None,
+            }, (time.time() - t0) * 1000)
+
+        elif "list" in desc:
+            # List key dirs with file counts and sizes
+            listing = {}
+            for dirname in ("skills", "trajectories", "backups"):
+                d = ANAH_DIR / dirname
+                if d.exists() and d.is_dir():
+                    files = [f for f in d.iterdir() if f.is_file()]
+                    total_size = sum(f.stat().st_size for f in files)
+                    listing[dirname] = {"files": len(files), "total_bytes": total_size}
+                else:
+                    listing[dirname] = {"files": 0, "total_bytes": 0}
+            return TaskResult(True, {
+                "handler": "file_ops", "operation": "list", "dirs": listing,
+            }, (time.time() - t0) * 1000)
+
+        elif "summarize" in desc:
+            # Read and summarize state.json + learning_log.json
+            summary = {}
+            for fname in ("state.json", "learning_log.json"):
+                fpath = ANAH_DIR / fname
+                resolved = fpath.resolve()
+                if not resolved.is_relative_to(ANAH_DIR):
+                    continue
+                if fpath.exists():
+                    data = json.loads(fpath.read_text())
+                    if isinstance(data, dict):
+                        summary[fname] = {
+                            "keys": list(data.keys()),
+                            "size_bytes": fpath.stat().st_size,
+                        }
+                    elif isinstance(data, list):
+                        summary[fname] = {
+                            "entries": len(data),
+                            "size_bytes": fpath.stat().st_size,
+                        }
+                else:
+                    summary[fname] = {"exists": False}
+            return TaskResult(True, {
+                "handler": "file_ops", "operation": "summarize", "summary": summary,
+            }, (time.time() - t0) * 1000)
+
+        else:
+            return TaskResult(False, {
+                "handler": "file_ops", "error": "Unknown file operation. Use archive, list, or summarize.",
+            }, (time.time() - t0) * 1000)
+
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "file_ops"}, (time.time() - t0) * 1000)
+
+
+def handle_web_research(task: dict) -> TaskResult:
+    """Fetch a URL and summarize its content."""
+    import urllib.request
+    t0 = time.time()
+    try:
+        desc = task.get("description") or task["title"]
+        url_match = re.search(r'https?://[^\s<>"\']+', desc)
+
+        if not url_match:
+            # No URL found — fall back to Ollama with a research prompt
+            return handle_ollama({
+                "title": task["title"],
+                "description": f"Research the following topic and provide findings: {desc}",
+            })
+
+        url = url_match.group(0)
+
+        # SECURITY: Block file://, localhost, and private IP ranges
+        blocked_patterns = [
+            r'^file://',
+            r'https?://localhost',
+            r'https?://127\.',
+            r'https?://10\.',
+            r'https?://172\.(1[6-9]|2[0-9]|3[01])\.',
+            r'https?://192\.168\.',
+            r'https?://\[::1\]',
+        ]
+        for pattern in blocked_patterns:
+            if re.match(pattern, url, re.IGNORECASE):
+                return TaskResult(False, {
+                    "handler": "web_research", "error": f"Blocked URL: {url}",
+                }, (time.time() - t0) * 1000)
+
+        req = urllib.request.Request(url, headers={"User-Agent": "ANAH-Executor/1.0"})
+        resp = urllib.request.urlopen(req, timeout=30)
+        raw = resp.read(100 * 1024)  # max 100KB
+        text = raw.decode("utf-8", errors="replace")
+
+        # Strip HTML tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        excerpt = text[:2000]
+
+        return TaskResult(True, {
+            "handler": "web_research",
+            "url": url,
+            "content_length": len(text),
+            "excerpt": excerpt,
+        }, (time.time() - t0) * 1000)
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "web_research"}, (time.time() - t0) * 1000)
+
+
+def handle_code_gen(task: dict) -> TaskResult:
+    """Generate a Python script or skill stub via Ollama."""
+    import urllib.request
+    t0 = time.time()
+    try:
+        desc = task.get("description") or task["title"]
+        prompt = f"""You are a Python code generator. Write a complete, well-documented Python script for the following request.
+
+Request: {desc}
+
+Return ONLY the Python code inside a single ```python code block. Include docstrings and comments."""
+
+        body = json.dumps({
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=body,
+            headers={"content-type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=MAX_TASK_TIMEOUT)
+        data = json.loads(resp.read())
+        content = data["message"]["content"]
+
+        # Extract code block
+        code_match = re.search(r'```(?:python)?\s*\n(.*?)```', content, re.DOTALL)
+        code = code_match.group(1).strip() if code_match else content.strip()
+
+        # Sanitize title for filename
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', task["title"])[:60]
+        stamp = int(time.time())
+        gen_dir = ANAH_DIR / "generated"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        out_file = gen_dir / f"{sanitized}_{stamp}.py"
+
+        # SECURITY: Never execute — only save
+        out_file.write_text(code, encoding="utf-8")
+
+        return TaskResult(True, {
+            "handler": "code_gen",
+            "file": str(out_file),
+            "lines": len(code.splitlines()),
+        }, (time.time() - t0) * 1000)
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "code_gen"}, (time.time() - t0) * 1000)
+
+
+def handle_notify(task: dict) -> TaskResult:
+    """Write a notification to a JSONL log file."""
+    t0 = time.time()
+    try:
+        title = task["title"]
+        desc = task.get("description") or ""
+
+        # Parse level from title prefix
+        level = "info"
+        if "notify:critical:" in title.lower():
+            level = "critical"
+            title = re.sub(r'(?i)notify:critical:\s*', '', title)
+        elif "notify:warning:" in title.lower():
+            level = "warning"
+            title = re.sub(r'(?i)notify:warning:\s*', '', title)
+
+        entry = {
+            "timestamp": time.time(),
+            "level": level,
+            "title": title,
+            "message": desc,
+        }
+
+        notif_file = ANAH_DIR / "notifications.json"
+        ANAH_DIR.mkdir(parents=True, exist_ok=True)
+        with open(str(notif_file), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        return TaskResult(True, {
+            "handler": "notify", "level": level, "logged": True,
+        }, (time.time() - t0) * 1000)
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "notify"}, (time.time() - t0) * 1000)
+
+
+def handle_schedule(task: dict) -> TaskResult:
+    """Manage scheduler presets by writing to config."""
+    t0 = time.time()
+    try:
+        desc = (task.get("description") or task["title"]).lower()
+        config_file = ANAH_DIR / "config.json"
+
+        # Read current config
+        if config_file.exists():
+            config = json.loads(config_file.read_text())
+        else:
+            config = {}
+
+        updated_field = None
+        new_value = None
+
+        # Parse "set heartbeat X"
+        hb_match = re.search(r'set\s+heartbeat\s+(\d+)', desc)
+        if hb_match:
+            val = int(hb_match.group(1))
+            if not (30 <= val <= 3600):
+                return TaskResult(False, {
+                    "handler": "schedule", "error": f"Heartbeat must be 30-3600, got {val}",
+                }, (time.time() - t0) * 1000)
+            config["heartbeat_interval"] = val
+            updated_field = "heartbeat_interval"
+            new_value = val
+
+        # Parse "set watchdog X"
+        wd_match = re.search(r'set\s+watchdog\s+(\d+)', desc)
+        if wd_match:
+            val = int(wd_match.group(1))
+            if not (10 <= val <= 600):
+                return TaskResult(False, {
+                    "handler": "schedule", "error": f"Watchdog must be 10-600, got {val}",
+                }, (time.time() - t0) * 1000)
+            config["watchdog_interval"] = val
+            updated_field = "watchdog_interval"
+            new_value = val
+
+        # Parse "set preset fast|default|conservative"
+        preset_match = re.search(r'set\s+preset\s+(fast|default|conservative)', desc)
+        if preset_match:
+            preset = preset_match.group(1)
+            presets = {
+                "fast": {"heartbeat_interval": 30, "watchdog_interval": 10},
+                "default": {"heartbeat_interval": 120, "watchdog_interval": 60},
+                "conservative": {"heartbeat_interval": 600, "watchdog_interval": 120},
+            }
+            config.update(presets[preset])
+            updated_field = "preset"
+            new_value = preset
+
+        if updated_field is None:
+            return TaskResult(False, {
+                "handler": "schedule",
+                "error": "Could not parse schedule command. Use: set heartbeat X, set watchdog X, or set preset fast|default|conservative",
+            }, (time.time() - t0) * 1000)
+
+        # Write updated config
+        ANAH_DIR.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+        return TaskResult(True, {
+            "handler": "schedule", "updated": updated_field, "value": new_value,
+        }, (time.time() - t0) * 1000)
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "schedule"}, (time.time() - t0) * 1000)
+
+
+def handle_skill_install(task: dict) -> TaskResult:
+    """Install a learned skill from description."""
+    t0 = time.time()
+    try:
+        desc = task.get("description") or task["title"]
+
+        # Parse skill name from description — expect "skill_name: ..." or first word
+        name_match = re.search(r'(?:skill\s+(?:named?|called)?\s*)?["\']?([a-zA-Z0-9-]+)["\']?', desc)
+        skill_name = name_match.group(1) if name_match else "unnamed-skill"
+
+        # SECURITY: Sanitize — alphanumeric + hyphens only
+        skill_name = re.sub(r'[^a-zA-Z0-9-]', '', skill_name).strip('-')
+        if not skill_name:
+            skill_name = "unnamed-skill"
+
+        # Use Path.name to prevent traversal
+        skill_name = Path(skill_name).name
+
+        skill_dir = ANAH_DIR / "skills" / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write SKILL.md with frontmatter
+        skill_md = skill_dir / "SKILL.md"
+        frontmatter = f"""---
+name: {skill_name}
+description: {desc[:200]}
+installed_at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+---
+
+# {skill_name}
+
+{desc}
+"""
+        skill_md.write_text(frontmatter, encoding="utf-8")
+
+        return TaskResult(True, {
+            "handler": "skill_install",
+            "skill": skill_name,
+            "path": str(skill_dir),
+        }, (time.time() - t0) * 1000)
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "skill_install"}, (time.time() - t0) * 1000)
+
+
 def handle_ollama(task: dict) -> TaskResult:
     """Send task to Ollama for general-purpose execution."""
     t0 = time.time()
@@ -311,6 +663,12 @@ HANDLERS = {
     "health_report": handle_health_report,
     "self_diagnostic": handle_self_diagnostic,
     "cleanup": handle_cleanup,
+    "file_ops": handle_file_ops,
+    "web_research": handle_web_research,
+    "code_gen": handle_code_gen,
+    "notify": handle_notify,
+    "schedule": handle_schedule,
+    "skill_install": handle_skill_install,
     "ollama": handle_ollama,
 }
 
