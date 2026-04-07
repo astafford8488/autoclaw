@@ -23,6 +23,7 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent
 BRAINSTEM_DIR = SKILLS_DIR / "anah-brainstem" / "scripts"
 CEREBELLUM_DIR = SKILLS_DIR / "anah-cerebellum" / "scripts"
 MEMORY_DIR = SKILLS_DIR / "anah-memory" / "scripts"
+NOTIFY_DIR = SKILLS_DIR / "anah-notify" / "scripts"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
@@ -485,8 +486,18 @@ def handle_notify(task: dict) -> TaskResult:
         with open(str(notif_file), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
+        # Dispatch to Discord (best-effort)
+        discord_sent = False
+        try:
+            if str(NOTIFY_DIR) not in sys.path:
+                sys.path.insert(0, str(NOTIFY_DIR))
+            import discord as discord_notify
+            discord_sent = discord_notify.send_notification(level, title, desc, source="executor")
+        except Exception:
+            pass
+
         return TaskResult(True, {
-            "handler": "notify", "level": level, "logged": True,
+            "handler": "notify", "level": level, "logged": True, "discord": discord_sent,
         }, (time.time() - t0) * 1000)
     except Exception as e:
         return TaskResult(False, {"error": str(e), "handler": "notify"}, (time.time() - t0) * 1000)

@@ -46,13 +46,46 @@ python scripts/orchestrator.py --cycle --generate
 
 ## Autoclaw Cron Integration
 
-Register as cron jobs:
-```bash
-# Full cycle every 3 minutes
-autoclaw cron add --name "anah-heartbeat" --every 3m --message "Run ANAH heartbeat cycle"
+ANAH can run as Autoclaw cron jobs for system-restart survival and framework integration.
 
-# L1 watchdog every 30 seconds
-autoclaw cron add --name "anah-watchdog" --every 30s --system-event "anah:watchdog"
+### Quick Setup
+
+```bash
+# Register all ANAH cron jobs (requires built openclaw CLI + running gateway)
+./scripts/register_cron.sh
+
+# Check status
+./scripts/register_cron.sh --status
+
+# Remove all ANAH cron jobs
+./scripts/register_cron.sh --remove
 ```
 
-Or run directly via Python for lower overhead.
+### Registered Jobs
+
+| Job | Schedule | Type | Purpose |
+|-----|----------|------|---------|
+| `anah-heartbeat` | Every 3m | Isolated agent | Full cycle: brainstem → cortex → executor → hippocampus |
+| `anah-watchdog` | Every 30s | Main session | Quick L1 health check |
+| `anah-training` | Daily 3 AM | Isolated agent | SFT/DPO dataset preparation |
+
+### Cron Bridge
+
+The `cron_bridge.py` script provides a clean JSON interface between Autoclaw cron and ANAH:
+
+```bash
+python scripts/cron_bridge.py heartbeat   # Full cycle with structured summary
+python scripts/cron_bridge.py watchdog    # Quick L1 check
+python scripts/cron_bridge.py status      # Status overview
+python scripts/cron_bridge.py train       # Training pipeline
+python scripts/cron_bridge.py export      # Export trajectories
+```
+
+### Standalone Mode
+
+For development or when gateway isn't available, use the standalone scheduler:
+
+```bash
+python scripts/scheduler.py --fast --generate   # Aggressive intervals + goal generation
+python scripts/scheduler.py --daemon             # Background mode
+```

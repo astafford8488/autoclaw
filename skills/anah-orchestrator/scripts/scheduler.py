@@ -7,6 +7,7 @@ Runs the orchestrator on configurable intervals. Includes:
 - Crash recovery (auto-restart on exception with backoff)
 - Resource guard (skip cycle if system is under heavy load)
 - Notification integration (writes critical alerts to notifications.json)
+- Discord webhook dispatch (sends heartbeat summaries and alerts)
 
 Usage:
     python scheduler.py                  # Default intervals
@@ -27,9 +28,16 @@ LOGS_DIR = ANAH_DIR / "logs"
 PID_FILE = ANAH_DIR / "scheduler.pid"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
-# Import orchestrator
+# Import orchestrator and discord notifier
 sys.path.insert(0, str(SCRIPTS_DIR))
 import orchestrator
+
+NOTIFY_DIR = Path(__file__).resolve().parent.parent.parent / "anah-notify" / "scripts"
+sys.path.insert(0, str(NOTIFY_DIR))
+try:
+    import discord as discord_notify
+except ImportError:
+    discord_notify = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +206,7 @@ def resource_guard() -> tuple[bool, str]:
 # Notification helper
 # ---------------------------------------------------------------------------
 def write_notification(level: str, title: str, message: str):
-    """Write a notification to the JSONL notification file."""
+    """Write a notification to the JSONL notification file and dispatch to Discord."""
     try:
         notif_file = ANAH_DIR / "notifications.json"
         entry = {
@@ -210,6 +218,39 @@ def write_notification(level: str, title: str, message: str):
         }
         with open(str(notif_file), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+    # Dispatch to Discord (best-effort, never blocks scheduler)
+    try:
+        if discord_notify:
+            discord_notify.send_notification(level, title, message, source="scheduler")
+    except Exception:
+        pass
+
+
+def discord_heartbeat_summary(result: dict):
+    """Send a heartbeat summary to Discord (best-effort)."""
+    if not discord_notify:
+        return
+    try:
+        # Build summary dict compatible with discord module
+        bs = result.get("brainstem", {})
+        cx = result.get("cortex", {})
+        ex = result.get("executor", {})
+        hp = result.get("hippocampus", {})
+        tj = result.get("trajectories", {})
+        summary = {
+            "gated": result.get("gated", False),
+            "health_score": bs.get("health_score", 0),
+            "goals_generated": cx.get("count", 0),
+            "tasks_processed": ex.get("processed", 0),
+            "tasks_succeeded": ex.get("succeeded", 0),
+            "skills_extracted": hp.get("extracted", 0),
+            "trajectories_exported": tj.get("exported", 0),
+            "duration_ms": round(result.get("duration_ms", 0)),
+            "summary": f"Health: {bs.get('health_score', 0):.1f}%",
+        }
+        discord_notify.send_heartbeat(summary)
     except Exception:
         pass
 
@@ -312,6 +353,9 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
                                    gated=True)
                     write_notification("warning", "Heartbeat Gated",
                                        "L1 failure suspended higher brain functions")
+
+                # Send heartbeat summary to Discord
+                discord_heartbeat_summary(result)
 
                 consecutive_failures = 0
             except Exception as e:
