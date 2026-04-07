@@ -287,6 +287,8 @@ def status_overview() -> dict:
             "total_goals": len(goals),
             "enacted": sum(1 for g in goals if g["status"] == "enacted"),
             "proposed": sum(1 for g in goals if g["status"] == "proposed"),
+            "pending_approval": sum(1 for g in goals if g["status"] == "pending_approval"),
+            "approval_mode": cortex.GOAL_APPROVAL,
         }
         db.close()
     except Exception:

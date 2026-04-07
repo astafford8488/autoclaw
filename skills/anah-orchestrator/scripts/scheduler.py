@@ -323,6 +323,20 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
             except Exception as e:
                 log_structured("ERROR", "watchdog", f"Exception: {e}", error=str(e))
                 consecutive_failures += 1
+
+            # Check for expired goal approvals on each watchdog tick
+            try:
+                import cortex
+                cdb = cortex.get_db()
+                expired = cortex.check_expired_approvals(cdb)
+                cdb.close()
+                if expired["enacted"] or expired["dismissed"]:
+                    log_structured("INFO", "approvals",
+                                   f"Expired: {expired['enacted']} auto-enacted, {expired['dismissed']} auto-dismissed",
+                                   **expired)
+            except Exception:
+                pass  # Cortex approval check is best-effort
+
             last_watchdog = now
 
         # Full heartbeat cycle (less frequent)

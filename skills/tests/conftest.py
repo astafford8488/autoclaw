@@ -63,7 +63,8 @@ def anah_db(anah_dir):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp REAL, title TEXT, priority INTEGER,
             description TEXT, reasoning TEXT, source TEXT,
-            context TEXT, status TEXT DEFAULT 'proposed', task_id INTEGER
+            context TEXT, status TEXT DEFAULT 'proposed', task_id INTEGER,
+            topic_hash TEXT, discord_message_id TEXT, expires_at REAL
         );
         CREATE TABLE IF NOT EXISTS agent_actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

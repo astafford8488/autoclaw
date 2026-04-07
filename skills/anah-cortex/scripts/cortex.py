@@ -2,11 +2,18 @@
 """ANAH Cortex — L5 autonomous goal generation.
 
 Analyzes cerebellum context and generates actionable goals via LLM
-or pattern-based fallback. Handles deduplication and goal lifecycle.
+or pattern-based fallback. Features:
+- Two-phase reasoning (analyze → generate)
+- Historical success scoring per handler type
+- Semantic dedup via topic_hash
+- Pattern templates from hippocampus learned skills
+- Goal approval mode with priority-based expiry
 """
 
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, asdict
@@ -18,22 +25,55 @@ DB_FILE = ANAH_DIR / "anah.db"
 
 COOLDOWN_SEC = 180  # 3 minutes between generation cycles
 
-SYSTEM_PROMPT = """You are ANAH's L5 Goal Generation engine — the autonomous reasoning layer (cortex) of a self-directed agent hierarchy.
+# Approval mode: set GOAL_APPROVAL=true in .env to require approval
+GOAL_APPROVAL = os.environ.get("GOAL_APPROVAL", "false").lower() == "true"
 
-Your role: analyze system state and generate actionable goals that improve system health, performance, and capabilities.
+# Priority-based expiry (seconds)
+EXPIRY_HIGH = int(os.environ.get("EXPIRY_HIGH", "300"))       # 5 min
+EXPIRY_MEDIUM = int(os.environ.get("EXPIRY_MEDIUM", "900"))   # 15 min
+EXPIRY_LOW = int(os.environ.get("EXPIRY_LOW", "1800"))        # 30 min
+
+# ---------------------------------------------------------------------------
+# Prompts — Two-phase reasoning
+# ---------------------------------------------------------------------------
+ANALYSIS_PROMPT = """You are ANAH's L5 analysis engine. Analyze the system state and identify what the system needs most right now.
 
 The hierarchy:
-- L1 (Brainstem): network, filesystem, compute monitoring
-- L2 (Brainstem): config integrity, DB integrity, backups
-- L3 (Brainstem): external API health, integration pings
-- L4 (Cerebellum): task metrics, pattern detection
-- L5 (Cortex): YOU — goal generation, planning, self-improvement
+- L1: network, filesystem, compute monitoring
+- L2: config integrity, DB integrity, backups
+- L3: external API health, integration pings
+- L4: task metrics, pattern detection
+- L5: YOU — goal generation, planning, self-improvement
+
+Consider:
+1. What areas need attention? (failing checks, degrading performance, idle resources)
+2. What has been tried recently and failed? (avoid repeating failures)
+3. What handler types have good success rates? (leverage strengths)
+4. What learned skills are available? (use existing capabilities)
+
+Respond with a brief JSON analysis:
+{
+  "needs": ["list of 1-3 system needs"],
+  "avoid": ["topics to avoid based on recent failures"],
+  "leverage": ["strengths or skills to build on"]
+}"""
+
+GENERATION_PROMPT = """You are ANAH's L5 Goal Generation engine — the autonomous reasoning layer (cortex) of a self-directed agent hierarchy.
+
+Your role: generate actionable goals that address the identified system needs.
+
+ANALYSIS of current needs:
+{analysis}
+
+HANDLER SUCCESS RATES (use high-success handlers, avoid consistently failing ones):
+{success_rates}
+
+AVAILABLE LEARNED SKILLS (leverage these where relevant):
+{skills}
 
 IMPORTANT: You will receive a list of recently generated goals. DO NOT propose similar goals.
-Generate NOVEL goals covering different aspects of the system.
-
 Generate 1-3 specific, actionable tasks as a JSON array. Each task:
-- title: descriptive action title
+- title: descriptive action title (prefix with handler type like "health_report:", "self_diagnostic:", "cleanup:")
 - priority: 0-9 (higher = more urgent)
 - description: what to accomplish
 - reasoning: why this is valuable now
@@ -48,6 +88,22 @@ Recently generated goals (DO NOT repeat these or similar topics):
 {recent_goals}
 
 Generate 1-3 actionable tasks that are DIFFERENT from recent goals. JSON only."""
+
+# Legacy single-phase prompt for fallback
+SYSTEM_PROMPT_LEGACY = """You are ANAH's L5 Goal Generation engine — the autonomous reasoning layer (cortex) of a self-directed agent hierarchy.
+
+Your role: analyze system state and generate actionable goals that improve system health, performance, and capabilities.
+
+IMPORTANT: You will receive a list of recently generated goals. DO NOT propose similar goals.
+Generate NOVEL goals covering different aspects of the system.
+
+Generate 1-3 specific, actionable tasks as a JSON array. Each task:
+- title: descriptive action title
+- priority: 0-9 (higher = more urgent)
+- description: what to accomplish
+- reasoning: why this is valuable now
+
+If the system is healthy and idle, generate exploratory or self-improvement tasks."""
 
 
 @dataclass
@@ -68,19 +124,23 @@ def get_db() -> sqlite3.Connection:
     return db
 
 
-def get_recent_goals(db: sqlite3.Connection, limit: int = 20) -> list[dict]:
+def get_recent_goals(db: sqlite3.Connection, limit: int = 50) -> list[dict]:
     cursor = db.execute(
         "SELECT * FROM generated_goals ORDER BY timestamp DESC LIMIT ?", (limit,)
     )
     return [dict(r) for r in cursor]
 
 
-def log_goal(db: sqlite3.Connection, goal: Goal, context: dict | None = None) -> int:
+def log_goal(db: sqlite3.Connection, goal: Goal, context: dict | None = None,
+             topic_hash: str | None = None, expires_at: float | None = None) -> int:
     cursor = db.execute(
-        """INSERT INTO generated_goals (timestamp, title, priority, description, reasoning, source, context, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed')""",
+        """INSERT INTO generated_goals
+           (timestamp, title, priority, description, reasoning, source, context, status, topic_hash, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (time.time(), goal.title, goal.priority, goal.description, goal.reasoning,
-         goal.source, json.dumps(context) if context else None),
+         goal.source, json.dumps(context) if context else None,
+         'pending_approval' if GOAL_APPROVAL else 'proposed',
+         topic_hash, expires_at),
     )
     db.commit()
     return cursor.lastrowid
@@ -106,9 +166,129 @@ def dismiss_goal(db: sqlite3.Connection, goal_id: int):
     db.commit()
 
 
+def approve_goal(db: sqlite3.Connection, goal_id: int) -> dict:
+    """Approve a pending goal and enqueue it as a task."""
+    row = db.execute("SELECT * FROM generated_goals WHERE id = ?", (goal_id,)).fetchone()
+    if not row:
+        return {"error": f"Goal {goal_id} not found"}
+    row = dict(row)
+    if row["status"] not in ("pending_approval", "proposed"):
+        return {"error": f"Goal {goal_id} is {row['status']}, not pending"}
+
+    goal = Goal(
+        title=row["title"], priority=row["priority"],
+        description=row.get("description", ""), reasoning=row.get("reasoning", ""),
+        source=row["source"],
+    )
+    task_id = enqueue_task(db, goal, goal_id)
+    return {"approved": goal_id, "task_id": task_id}
+
+
+def check_expired_approvals(db: sqlite3.Connection) -> dict:
+    """Check for pending approvals that have expired. Auto-enact or auto-dismiss based on priority."""
+    now = time.time()
+    cursor = db.execute(
+        "SELECT * FROM generated_goals WHERE status = 'pending_approval' AND expires_at IS NOT NULL AND expires_at < ?",
+        (now,),
+    )
+    enacted = 0
+    dismissed = 0
+    for row in cursor.fetchall():
+        row = dict(row)
+        priority = row.get("priority", 0)
+        if priority >= 7:
+            # High priority: auto-enact
+            goal = Goal(
+                title=row["title"], priority=priority,
+                description=row.get("description", ""), reasoning=row.get("reasoning", ""),
+                source=row["source"],
+            )
+            enqueue_task(db, goal, row["id"])
+            enacted += 1
+        elif priority >= 4:
+            # Medium priority: auto-enact
+            goal = Goal(
+                title=row["title"], priority=priority,
+                description=row.get("description", ""), reasoning=row.get("reasoning", ""),
+                source=row["source"],
+            )
+            enqueue_task(db, goal, row["id"])
+            enacted += 1
+        else:
+            # Low priority: auto-dismiss
+            dismiss_goal(db, row["id"])
+            dismissed += 1
+    return {"enacted": enacted, "dismissed": dismissed}
+
+
 # ---------------------------------------------------------------------------
-# Deduplication
+# Historical success scoring
 # ---------------------------------------------------------------------------
+def get_handler_success_rates(db: sqlite3.Connection) -> dict[str, dict]:
+    """Query task_queue for completion rates grouped by handler type (title prefix)."""
+    cursor = db.execute(
+        """SELECT
+             CASE
+               WHEN title LIKE 'health_report:%' THEN 'health_report'
+               WHEN title LIKE 'self_diagnostic:%' THEN 'self_diagnostic'
+               WHEN title LIKE 'cleanup:%' THEN 'cleanup'
+               WHEN title LIKE 'echo:%' THEN 'echo'
+               WHEN title LIKE 'hermes:%' THEN 'hermes'
+               WHEN title LIKE 'notify:%' THEN 'notify'
+               WHEN title LIKE 'resource_check:%' THEN 'resource_check'
+               WHEN title LIKE 'config_audit:%' THEN 'config_audit'
+               WHEN title LIKE 'backup:%' THEN 'backup'
+               WHEN title LIKE 'api_ping:%' THEN 'api_ping'
+               WHEN title LIKE 'log_analysis:%' THEN 'log_analysis'
+               ELSE 'other'
+             END as handler,
+             COUNT(*) as total,
+             SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+           FROM task_queue
+           WHERE created_at > ?
+           GROUP BY handler""",
+        (time.time() - 7 * 86400,),  # Last 7 days
+    )
+    rates = {}
+    for row in cursor:
+        r = dict(row)
+        total = r["total"]
+        rate = r["completed"] / total * 100 if total > 0 else 0
+        rates[r["handler"]] = {
+            "total": total,
+            "completed": r["completed"],
+            "failed": r["failed"],
+            "success_rate": round(rate, 1),
+        }
+    return rates
+
+
+def format_success_rates(rates: dict) -> str:
+    """Format success rates for prompt injection."""
+    if not rates:
+        return "No task history yet."
+    lines = []
+    for handler, data in sorted(rates.items(), key=lambda x: x[1]["success_rate"], reverse=True):
+        emoji = "good" if data["success_rate"] >= 70 else "poor" if data["success_rate"] < 40 else "moderate"
+        lines.append(f"- {handler}: {data['success_rate']}% success ({data['completed']}/{data['total']}) [{emoji}]")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Semantic dedup via topic_hash
+# ---------------------------------------------------------------------------
+def compute_topic_hash(title: str) -> str:
+    """Compute a semantic topic hash from sorted keywords."""
+    stop = {"health_report:", "self_diagnostic:", "cleanup:", "echo:", "hermes:",
+            "notify:", "resource_check:", "config_audit:", "backup:", "api_ping:",
+            "log_analysis:", "a", "the", "and", "of", "for", "to", "in", "on",
+            "is", "it", "that", "this", "with", "as", "at", "by", "an"}
+    words = set(re.sub(r"[^a-z0-9\s]", "", title.lower()).split()) - stop
+    key = " ".join(sorted(words))
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
 def titles_similar(a: str, b: str, threshold: float = 0.5) -> bool:
     stop = {"health_report:", "self_diagnostic:", "cleanup:", "echo:", "a", "the", "and", "of", "for", "to", "in"}
     words_a = set(a.lower().split()) - stop
@@ -119,12 +299,54 @@ def titles_similar(a: str, b: str, threshold: float = 0.5) -> bool:
     return overlap / min(len(words_a), len(words_b)) >= threshold
 
 
-def dedup_goals(new_goals: list[Goal], recent_titles: list[str]) -> list[Goal]:
+def dedup_goals(new_goals: list[Goal], recent: list[dict]) -> list[Goal]:
+    """Deduplicate using both word overlap and topic_hash."""
+    recent_titles = [g["title"] for g in recent if g.get("status") != "dismissed"]
+    recent_hashes = {g.get("topic_hash") for g in recent if g.get("topic_hash")} - {None}
+
     filtered = []
     for g in new_goals:
-        if not any(titles_similar(g.title, rt) for rt in recent_titles):
-            filtered.append(g)
+        # Word overlap check
+        if any(titles_similar(g.title, rt) for rt in recent_titles):
+            continue
+        # Topic hash check
+        h = compute_topic_hash(g.title)
+        if h in recent_hashes:
+            continue
+        recent_hashes.add(h)  # Prevent intra-batch duplicates
+        filtered.append(g)
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Hippocampus skill templates
+# ---------------------------------------------------------------------------
+def get_learned_skills() -> list[dict]:
+    """Query hippocampus for learned skills to use as templates."""
+    skills_dir = ANAH_DIR / "skills"
+    if not skills_dir.exists():
+        return []
+    skills = []
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+            content = (skill_dir / "SKILL.md").read_text()
+            name = skill_dir.name
+            desc = ""
+            category = ""
+            for line in content.splitlines():
+                if line.startswith("description:"):
+                    desc = line.split(":", 1)[1].strip().strip('"')
+                if "Category:" in line:
+                    category = line.split(":", 1)[1].strip()
+            skills.append({"name": name, "description": desc, "category": category})
+    return skills
+
+
+def format_skills(skills: list[dict]) -> str:
+    """Format learned skills for prompt injection."""
+    if not skills:
+        return "No learned skills yet."
+    return "\n".join(f"- {s['name']}: {s['description']}" for s in skills[:10])
 
 
 # ---------------------------------------------------------------------------
@@ -152,55 +374,53 @@ def _parse_llm_response(content: str) -> list[Goal]:
     ) for t in tasks]
 
 
-def _build_user_message(context: dict, recent_goals_text: str) -> str:
-    return USER_PROMPT.format(
-        context=json.dumps(context, indent=2),
-        recent_goals=recent_goals_text,
-    )
+def _parse_analysis_response(content: str) -> dict:
+    """Extract analysis JSON from LLM response."""
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0]
+    elif "```" in content:
+        content = content.split("```")[1].split("```")[0]
+    try:
+        return json.loads(content.strip())
+    except json.JSONDecodeError:
+        return {"needs": ["general system health"], "avoid": [], "leverage": []}
 
 
-def generate_goals_ollama(context: dict, recent_goals_text: str) -> list[Goal]:
-    """Generate goals via local Ollama instance (free, no API key)."""
+def _call_ollama(messages: list[dict], timeout: int = 60) -> str | None:
+    """Call Ollama chat API. Returns content or None on failure."""
     import urllib.request
     try:
         body = json.dumps({
             "model": OLLAMA_MODEL,
             "stream": False,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_message(context, recent_goals_text)},
-            ],
+            "messages": messages,
         }).encode()
-
         req = urllib.request.Request(
             f"{OLLAMA_URL}/api/chat",
             data=body,
             headers={"content-type": "application/json"},
         )
-        resp = urllib.request.urlopen(req, timeout=60)
+        resp = urllib.request.urlopen(req, timeout=timeout)
         data = json.loads(resp.read())
-        content = data["message"]["content"]
-        return _parse_llm_response(content)
+        return data["message"]["content"]
     except Exception as e:
         print(f"[cortex] Ollama failed ({OLLAMA_MODEL}): {e}", file=__import__("sys").stderr)
-        return []
+        return None
 
 
-def generate_goals_haiku(context: dict, recent_goals_text: str) -> list[Goal]:
-    """Generate goals via Anthropic Haiku (cheap cloud fallback)."""
+def _call_haiku(system: str, user: str) -> str | None:
+    """Call Anthropic Haiku API. Returns content or None on failure."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return []
-
+        return None
     import urllib.request
     try:
         body = json.dumps({
             "model": HAIKU_MODEL,
             "max_tokens": 1024,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": _build_user_message(context, recent_goals_text)}],
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
         }).encode()
-
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
             data=body,
@@ -212,28 +432,97 @@ def generate_goals_haiku(context: dict, recent_goals_text: str) -> list[Goal]:
         )
         resp = urllib.request.urlopen(req, timeout=30)
         data = json.loads(resp.read())
-        content = data["content"][0]["text"]
-        return _parse_llm_response(content)
+        return data["content"][0]["text"]
     except Exception as e:
         print(f"[cortex] Haiku failed: {e}", file=__import__("sys").stderr)
-        return []
+        return None
+
+
+def _build_user_message(context: dict, recent_goals_text: str) -> str:
+    return USER_PROMPT.format(
+        context=json.dumps(context, indent=2),
+        recent_goals=recent_goals_text,
+    )
+
+
+def generate_goals_twophase(context: dict, recent_goals_text: str,
+                             success_rates: dict, skills: list[dict]) -> list[Goal]:
+    """Two-phase generation: analyze needs → generate targeted goals."""
+    # Phase 1: Analysis
+    analysis_user = f"System state:\n{json.dumps(context, indent=2)}\n\nRecent goals:\n{recent_goals_text}"
+    analysis_content = _call_ollama([
+        {"role": "system", "content": ANALYSIS_PROMPT},
+        {"role": "user", "content": analysis_user},
+    ], timeout=30)
+
+    if not analysis_content:
+        analysis_content = _call_haiku(ANALYSIS_PROMPT, analysis_user)
+
+    analysis = _parse_analysis_response(analysis_content) if analysis_content else {
+        "needs": ["general system health check"], "avoid": [], "leverage": []
+    }
+
+    # Phase 2: Targeted generation
+    gen_system = GENERATION_PROMPT.format(
+        analysis=json.dumps(analysis, indent=2),
+        success_rates=format_success_rates(success_rates),
+        skills=format_skills(skills),
+    )
+    gen_user = _build_user_message(context, recent_goals_text)
+
+    content = _call_ollama([
+        {"role": "system", "content": gen_system},
+        {"role": "user", "content": gen_user},
+    ])
+
+    if content:
+        try:
+            goals = _parse_llm_response(content)
+            print(f"[cortex] Generated {len(goals)} goals via Ollama two-phase ({OLLAMA_MODEL})",
+                  file=__import__("sys").stderr)
+            return goals
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Fallback to Haiku
+    content = _call_haiku(gen_system, gen_user)
+    if content:
+        try:
+            goals = _parse_llm_response(content)
+            print(f"[cortex] Generated {len(goals)} goals via Haiku two-phase",
+                  file=__import__("sys").stderr)
+            return goals
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return []
 
 
 def generate_goals_llm(context: dict, recent_goals_text: str) -> list[Goal]:
-    """Try Ollama first, fall back to Haiku, then return empty for pattern fallback."""
-    # 1. Ollama (free, local)
-    goals = generate_goals_ollama(context, recent_goals_text)
-    if goals:
-        print(f"[cortex] Generated {len(goals)} goals via Ollama ({OLLAMA_MODEL})", file=__import__("sys").stderr)
-        return goals
+    """Legacy single-phase generation (fallback if two-phase returns empty)."""
+    content = _call_ollama([
+        {"role": "system", "content": SYSTEM_PROMPT_LEGACY},
+        {"role": "user", "content": _build_user_message(context, recent_goals_text)},
+    ])
+    if content:
+        try:
+            goals = _parse_llm_response(content)
+            print(f"[cortex] Generated {len(goals)} goals via Ollama legacy ({OLLAMA_MODEL})",
+                  file=__import__("sys").stderr)
+            return goals
+        except (json.JSONDecodeError, KeyError):
+            pass
 
-    # 2. Haiku (cheap cloud)
-    goals = generate_goals_haiku(context, recent_goals_text)
-    if goals:
-        print(f"[cortex] Generated {len(goals)} goals via Haiku", file=__import__("sys").stderr)
-        return goals
+    content = _call_haiku(SYSTEM_PROMPT_LEGACY, _build_user_message(context, recent_goals_text))
+    if content:
+        try:
+            goals = _parse_llm_response(content)
+            print(f"[cortex] Generated {len(goals)} goals via Haiku legacy",
+                  file=__import__("sys").stderr)
+            return goals
+        except (json.JSONDecodeError, KeyError):
+            pass
 
-    # 3. Return empty → caller uses pattern fallback
     return []
 
 
@@ -262,36 +551,74 @@ def generate_goals_fallback(context: dict, patterns: list[dict]) -> list[Goal]:
 
 
 # ---------------------------------------------------------------------------
+# Expiry calculation
+# ---------------------------------------------------------------------------
+def compute_expiry(priority: int) -> float:
+    """Compute expiry timestamp based on priority level."""
+    now = time.time()
+    if priority >= 7:
+        return now + EXPIRY_HIGH
+    elif priority >= 4:
+        return now + EXPIRY_MEDIUM
+    else:
+        return now + EXPIRY_LOW
+
+
+# ---------------------------------------------------------------------------
 # Main generation cycle
 # ---------------------------------------------------------------------------
 def run_generation(context: dict, patterns: list[dict]) -> list[dict]:
-    """Full L5 generation cycle. Returns list of enacted goal dicts."""
+    """Full L5 generation cycle. Returns list of enacted/proposed goal dicts."""
     db = get_db()
 
-    # Fetch recent goals for dedup
-    recent = get_recent_goals(db)
-    recent_titles = [g["title"] for g in recent if g.get("status") != "dismissed"]
+    # Fetch recent goals for dedup (increased to 50 for topic_hash coverage)
+    recent = get_recent_goals(db, limit=50)
     recent_text = "\n".join(
         f"- [{g.get('status', '?')}] {g['title']}" for g in recent[:15]
     ) if recent else "None (first generation cycle)"
 
-    # Generate
-    goals = generate_goals_llm(context, recent_text)
+    # Get historical success rates
+    success_rates = get_handler_success_rates(db)
+
+    # Get learned skills
+    skills = get_learned_skills()
+
+    # Generate — two-phase first, then legacy, then pattern fallback
+    goals = generate_goals_twophase(context, recent_text, success_rates, skills)
+    if not goals:
+        goals = generate_goals_llm(context, recent_text)
     if not goals:
         goals = generate_goals_fallback(context, patterns)
 
-    # Dedup
-    goals = dedup_goals(goals, recent_titles)
+    # Dedup (word overlap + topic hash)
+    goals = dedup_goals(goals, recent)
 
-    # Enqueue
-    enacted = []
+    # Log and optionally enqueue
+    results = []
     for goal in goals:
-        goal_id = log_goal(db, goal, context)
-        task_id = enqueue_task(db, goal, goal_id)
-        enacted.append({**asdict(goal), "goal_id": goal_id, "task_id": task_id})
+        topic_hash = compute_topic_hash(goal.title)
+        expires_at = compute_expiry(goal.priority) if GOAL_APPROVAL else None
+        goal_id = log_goal(db, goal, context, topic_hash=topic_hash, expires_at=expires_at)
+
+        if GOAL_APPROVAL:
+            # Goals wait for approval (or auto-expire)
+            results.append({
+                **asdict(goal), "goal_id": goal_id,
+                "status": "pending_approval",
+                "expires_at": expires_at,
+                "topic_hash": topic_hash,
+            })
+        else:
+            # Immediately enqueue
+            task_id = enqueue_task(db, goal, goal_id)
+            results.append({
+                **asdict(goal), "goal_id": goal_id, "task_id": task_id,
+                "status": "enacted",
+                "topic_hash": topic_hash,
+            })
 
     db.close()
-    return enacted
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -309,10 +636,15 @@ if __name__ == "__main__":
                 key, val = line.split("=", 1)
                 os.environ.setdefault(key.strip(), val.strip())
 
+    # Re-read approval mode after env load
+    GOAL_APPROVAL = os.environ.get("GOAL_APPROVAL", "false").lower() == "true"
+
     parser = argparse.ArgumentParser(description="ANAH Cortex — L5 goal generation")
     parser.add_argument("--generate", "-g", action="store_true", help="Run a generation cycle")
     parser.add_argument("--status", "-s", action="store_true", help="Show recent goals and stats")
     parser.add_argument("--dismiss", "-d", type=int, help="Dismiss a goal by ID")
+    parser.add_argument("--approve", "-a", type=int, help="Approve a pending goal by ID")
+    parser.add_argument("--check-expired", action="store_true", help="Process expired approvals")
     parser.add_argument("--context", type=str, help="Path to cerebellum context JSON (or - for stdin)")
     args = parser.parse_args()
 
@@ -323,6 +655,16 @@ if __name__ == "__main__":
         dismiss_goal(db, args.dismiss)
         db.close()
         print(json.dumps({"dismissed": args.dismiss}))
+    elif args.approve:
+        db = get_db()
+        result = approve_goal(db, args.approve)
+        db.close()
+        print(json.dumps(result))
+    elif args.check_expired:
+        db = get_db()
+        result = check_expired_approvals(db)
+        db.close()
+        print(json.dumps(result))
     elif args.status:
         db = get_db()
         goals = get_recent_goals(db)
@@ -330,9 +672,15 @@ if __name__ == "__main__":
             "total": len(goals),
             "enacted": sum(1 for g in goals if g["status"] == "enacted"),
             "proposed": sum(1 for g in goals if g["status"] == "proposed"),
+            "pending_approval": sum(1 for g in goals if g["status"] == "pending_approval"),
             "dismissed": sum(1 for g in goals if g["status"] == "dismissed"),
         }
-        print(json.dumps({"stats": stats, "recent": goals[:10]}, indent=2, default=str))
+        success_rates = get_handler_success_rates(db)
+        print(json.dumps({
+            "stats": stats, "recent": goals[:10],
+            "handler_success_rates": success_rates,
+            "approval_mode": GOAL_APPROVAL,
+        }, indent=2, default=str))
         db.close()
     elif args.generate:
         # Load context from cerebellum
@@ -354,6 +702,7 @@ if __name__ == "__main__":
         context = data.get("context", {})
         patterns = data.get("patterns", [])
         enacted = run_generation(context, patterns)
-        print(json.dumps({"enacted": enacted, "count": len(enacted)}, indent=2))
+        print(json.dumps({"enacted": enacted, "count": len(enacted),
+                          "approval_mode": GOAL_APPROVAL}, indent=2))
     else:
         parser.print_help()
