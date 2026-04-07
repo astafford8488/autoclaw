@@ -130,6 +130,67 @@ def api_memory() -> dict:
         }
 
 
+def api_trajectories() -> dict:
+    """Trajectory stats and recent entries."""
+    traj_dir = ANAH_DIR / "trajectories"
+    training_dir = ANAH_DIR / "training"
+    result = {"total_files": 0, "total_trajectories": 0, "recent": [], "training": {}}
+
+    if traj_dir.exists():
+        files = sorted(traj_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+        result["total_files"] = len(files)
+        # Load recent trajectories for display
+        all_trajs = []
+        for f in files[:5]:
+            try:
+                data = json.loads(f.read_text())
+                if isinstance(data, list):
+                    all_trajs.extend(data)
+                elif isinstance(data, dict):
+                    all_trajs.append(data)
+            except Exception:
+                continue
+        result["total_trajectories"] = len(all_trajs)
+        result["recent"] = [
+            {
+                "task_id": t.get("metadata", {}).get("task_id"),
+                "title": t.get("metadata", {}).get("title", "unknown"),
+                "outcome": t.get("metadata", {}).get("outcome", "unknown"),
+                "duration_ms": t.get("metadata", {}).get("duration_ms"),
+                "source": t.get("metadata", {}).get("source", "unknown"),
+            }
+            for t in all_trajs[:20]
+        ]
+
+    # Training dataset info
+    for name in ("sft_dataset.jsonl", "dpo_dataset.jsonl", "Modelfile"):
+        p = training_dir / name
+        if p.exists():
+            result["training"][name] = {
+                "size_bytes": p.stat().st_size,
+                "modified": p.stat().st_mtime,
+            }
+            if name.endswith(".jsonl"):
+                with open(str(p)) as f:
+                    result["training"][name]["entries"] = sum(1 for _ in f)
+
+    return result
+
+
+def api_logs() -> dict:
+    """Recent scheduler logs."""
+    log_file = ANAH_DIR / "logs" / "scheduler.jsonl"
+    entries = []
+    if log_file.exists():
+        lines = log_file.read_text().strip().splitlines()
+        for line in lines[-30:]:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    return {"entries": entries, "count": len(entries)}
+
+
 def api_overview() -> dict:
     """Combined status overview."""
     return {
@@ -138,6 +199,7 @@ def api_overview() -> dict:
         "goals": api_goals(),
         "skills": api_skills(),
         "memory": api_memory(),
+        "trajectories": api_trajectories(),
         "timestamp": time.time(),
     }
 
@@ -161,6 +223,8 @@ API_ROUTES = {
     "/api/goals": api_goals,
     "/api/skills": api_skills,
     "/api/memory": api_memory,
+    "/api/trajectories": api_trajectories,
+    "/api/logs": api_logs,
     "/api/overview": api_overview,
 }
 
@@ -257,9 +321,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="grid">
+  <div class="card">
+    <h2>Trajectories &amp; Training</h2>
+    <div id="trajPanel"></div>
+  </div>
+  <div class="card">
+    <h2>Learned Skills</h2>
+    <div id="skillsPanel"></div>
+  </div>
+</div>
+
 <div class="card" style="margin-bottom:12px">
-  <h2>Learned Skills</h2>
-  <div id="skillsPanel"></div>
+  <h2>Scheduler Log</h2>
+  <div id="logPanel" style="max-height:250px;overflow-y:auto;font-size:0.8em;font-family:monospace"></div>
 </div>
 
 <script>
@@ -286,6 +361,7 @@ function renderStats(d) {
     <div class="stat"><div class="stat-value green">${q.counts.completed||0}</div><div class="stat-label">Completed</div></div>
     <div class="stat"><div class="stat-value">${g.stats.total}</div><div class="stat-label">Goals</div></div>
     <div class="stat"><div class="stat-value purple">${sk.count}</div><div class="stat-label">Skills</div></div>
+    <div class="stat"><div class="stat-value">${d.trajectories?.total_trajectories||0}</div><div class="stat-label">Trajectories</div></div>
   `;
 }
 
@@ -339,16 +415,55 @@ function renderSkills(s) {
   document.getElementById('skillsPanel').innerHTML = html;
 }
 
+function renderTrajectories(t) {
+  let html = `<div class="stat-row" style="margin-bottom:8px">
+    <div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">${t.total_trajectories}</div><div class="stat-label">Trajectories</div></div>
+    <div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">${t.total_files}</div><div class="stat-label">Files</div></div>
+    <div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">${t.training?.['sft_dataset.jsonl']?.entries||0}</div><div class="stat-label">SFT Ready</div></div>
+  </div>`;
+  if (t.training?.['sft_dataset.jsonl']) {
+    const sft = t.training['sft_dataset.jsonl'];
+    html += `<div style="font-size:0.8em;color:var(--text-dim);margin-bottom:6px">SFT dataset: ${sft.entries} examples (${(sft.size_bytes/1024).toFixed(1)}KB) &bull; Updated ${ago(sft.modified)}</div>`;
+  }
+  if (t.training?.['Modelfile']) {
+    html += `<div style="font-size:0.8em;margin-bottom:6px"><span class="badge badge-green">Modelfile ready</span></div>`;
+  }
+  if (t.recent.length) {
+    html += '<table><tr><th>Task</th><th>Outcome</th><th>Duration</th></tr>';
+    for (const r of t.recent.slice(0, 8)) {
+      const dur = r.duration_ms ? (r.duration_ms/1000).toFixed(1)+'s' : '-';
+      html += `<tr><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.title}</td><td>${statusBadge(r.outcome)}</td><td>${dur}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  document.getElementById('trajPanel').innerHTML = html;
+}
+
+function renderLogs(logs) {
+  if (!logs.entries.length) { document.getElementById('logPanel').innerHTML = '<span style="color:var(--text-dim)">No logs yet</span>'; return; }
+  let html = '';
+  const levelColor = {INFO:'var(--text-dim)',WARN:'var(--yellow)',ERROR:'var(--red)'};
+  for (const e of logs.entries.slice().reverse()) {
+    const color = levelColor[e.level] || 'var(--text-dim)';
+    html += `<div style="padding:2px 0;border-bottom:1px solid var(--border)"><span style="color:${color}">[${e.ts?.substring(11,19)||''}]</span> <span style="color:var(--accent)">${e.component}</span> ${e.message}</div>`;
+  }
+  document.getElementById('logPanel').innerHTML = html;
+}
+
 async function refresh() {
   try {
-    const r = await fetch('/api/overview');
-    const d = await r.json();
-    renderStats(d);
-    renderHealth(d.health);
-    renderMemory(d.memory);
-    renderQueue(d.queue);
-    renderGoals(d.goals);
-    renderSkills(d.skills);
+    const [overview, logs] = await Promise.all([
+      fetch('/api/overview').then(r=>r.json()),
+      fetch('/api/logs').then(r=>r.json()),
+    ]);
+    renderStats(overview);
+    renderHealth(overview.health);
+    renderMemory(overview.memory);
+    renderQueue(overview.queue);
+    renderGoals(overview.goals);
+    renderSkills(overview.skills);
+    renderTrajectories(overview.trajectories);
+    renderLogs(logs);
     document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
   } catch(e) {
     document.getElementById('lastUpdate').textContent = 'Error: ' + e.message;

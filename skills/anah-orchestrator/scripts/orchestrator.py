@@ -71,14 +71,80 @@ def run_cerebellum(brainstem_results: dict) -> dict:
     }
 
 
+def enrich_context(context: dict) -> dict:
+    """Inject richer context for cortex goal generation."""
+    enriched = dict(context)
+
+    # Learned skills catalog
+    try:
+        import hippocampus
+        skills = hippocampus.list_learned_skills()
+        enriched["learned_skills"] = {
+            "count": len(skills),
+            "names": [s.get("name", "unknown") for s in skills[:10]],
+        }
+    except Exception:
+        enriched["learned_skills"] = {"count": 0, "names": []}
+
+    # Recent trajectory outcomes (last 10)
+    try:
+        import memory as mem_mod
+        trajs = mem_mod.export_trajectories(since_hours=6, limit=10)
+        enriched["recent_trajectories"] = {
+            "count": len(trajs),
+            "outcomes": [t["metadata"]["outcome"] for t in trajs if "metadata" in t],
+            "titles": [t["metadata"]["title"] for t in trajs if "metadata" in t][:5],
+        }
+    except Exception:
+        enriched["recent_trajectories"] = {"count": 0}
+
+    # Training data stats
+    try:
+        training_dir = ANAH_DIR / "training"
+        sft_file = training_dir / "sft_dataset.jsonl"
+        if sft_file.exists():
+            with open(str(sft_file)) as f:
+                sft_count = sum(1 for _ in f)
+            enriched["training"] = {"sft_examples": sft_count}
+    except Exception:
+        pass
+
+    # Recent notifications (last 5)
+    try:
+        notif_file = ANAH_DIR / "notifications.json"
+        if notif_file.exists():
+            lines = notif_file.read_text().strip().splitlines()
+            recent = [json.loads(l) for l in lines[-5:]]
+            enriched["recent_notifications"] = [
+                {"level": n["level"], "title": n["title"]} for n in recent
+            ]
+    except Exception:
+        pass
+
+    # Level status from state
+    try:
+        state_file = ANAH_DIR / "state.json"
+        if state_file.exists():
+            state = json.loads(state_file.read_text())
+            enriched["level_status"] = {
+                f"L{k}": v.get("status", "unknown")
+                for k, v in state.get("levels", {}).items()
+            }
+    except Exception:
+        pass
+
+    return enriched
+
+
 def run_cortex(cerebellum_output: dict, generate: bool = True) -> dict:
-    """Generate goals from cerebellum context."""
+    """Generate goals from enriched cerebellum context."""
     if not generate:
         return {"skipped": True, "reason": "generation disabled"}
 
     import cortex
 
     context = cerebellum_output.get("context", {})
+    context = enrich_context(context)
     patterns = cerebellum_output.get("patterns", [])
     enacted = cortex.run_generation(context, patterns)
     return {"enacted": enacted, "count": len(enacted)}
