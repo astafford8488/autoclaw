@@ -128,9 +128,66 @@ def dedup_goals(new_goals: list[Goal], recent_titles: list[str]) -> list[Goal]:
 
 
 # ---------------------------------------------------------------------------
-# LLM generation
+# LLM generation — Ollama (primary) → Haiku (fallback)
 # ---------------------------------------------------------------------------
-def generate_goals_llm(context: dict, recent_goals_text: str) -> list[Goal]:
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _parse_llm_response(content: str) -> list[Goal]:
+    """Extract goals from LLM response text (handles markdown fences)."""
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0]
+    elif "```" in content:
+        content = content.split("```")[1].split("```")[0]
+
+    tasks = json.loads(content.strip())
+    if isinstance(tasks, dict):
+        tasks = [tasks]  # Single goal returned without array wrapper
+    return [Goal(
+        title=t["title"], priority=t.get("priority", 3),
+        description=t.get("description", ""), reasoning=t.get("reasoning", ""),
+        source="llm",
+    ) for t in tasks]
+
+
+def _build_user_message(context: dict, recent_goals_text: str) -> str:
+    return USER_PROMPT.format(
+        context=json.dumps(context, indent=2),
+        recent_goals=recent_goals_text,
+    )
+
+
+def generate_goals_ollama(context: dict, recent_goals_text: str) -> list[Goal]:
+    """Generate goals via local Ollama instance (free, no API key)."""
+    import urllib.request
+    try:
+        body = json.dumps({
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_message(context, recent_goals_text)},
+            ],
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=body,
+            headers={"content-type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=60)
+        data = json.loads(resp.read())
+        content = data["message"]["content"]
+        return _parse_llm_response(content)
+    except Exception as e:
+        print(f"[cortex] Ollama failed ({OLLAMA_MODEL}): {e}", file=__import__("sys").stderr)
+        return []
+
+
+def generate_goals_haiku(context: dict, recent_goals_text: str) -> list[Goal]:
+    """Generate goals via Anthropic Haiku (cheap cloud fallback)."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return []
@@ -138,13 +195,10 @@ def generate_goals_llm(context: dict, recent_goals_text: str) -> list[Goal]:
     import urllib.request
     try:
         body = json.dumps({
-            "model": "claude-sonnet-4-20250514",
+            "model": HAIKU_MODEL,
             "max_tokens": 1024,
             "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": USER_PROMPT.format(
-                context=json.dumps(context, indent=2),
-                recent_goals=recent_goals_text,
-            )}],
+            "messages": [{"role": "user", "content": _build_user_message(context, recent_goals_text)}],
         }).encode()
 
         req = urllib.request.Request(
@@ -159,21 +213,28 @@ def generate_goals_llm(context: dict, recent_goals_text: str) -> list[Goal]:
         resp = urllib.request.urlopen(req, timeout=30)
         data = json.loads(resp.read())
         content = data["content"][0]["text"]
-
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-
-        tasks = json.loads(content.strip())
-        return [Goal(
-            title=t["title"], priority=t.get("priority", 3),
-            description=t.get("description", ""), reasoning=t.get("reasoning", ""),
-            source="llm",
-        ) for t in tasks]
+        return _parse_llm_response(content)
     except Exception as e:
-        print(f"LLM generation failed: {e}", file=__import__("sys").stderr)
+        print(f"[cortex] Haiku failed: {e}", file=__import__("sys").stderr)
         return []
+
+
+def generate_goals_llm(context: dict, recent_goals_text: str) -> list[Goal]:
+    """Try Ollama first, fall back to Haiku, then return empty for pattern fallback."""
+    # 1. Ollama (free, local)
+    goals = generate_goals_ollama(context, recent_goals_text)
+    if goals:
+        print(f"[cortex] Generated {len(goals)} goals via Ollama ({OLLAMA_MODEL})", file=__import__("sys").stderr)
+        return goals
+
+    # 2. Haiku (cheap cloud)
+    goals = generate_goals_haiku(context, recent_goals_text)
+    if goals:
+        print(f"[cortex] Generated {len(goals)} goals via Haiku", file=__import__("sys").stderr)
+        return goals
+
+    # 3. Return empty → caller uses pattern fallback
+    return []
 
 
 def generate_goals_fallback(context: dict, patterns: list[dict]) -> list[Goal]:

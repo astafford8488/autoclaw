@@ -138,40 +138,119 @@ class TestGoalLifecycle:
         assert dict(row)["status"] == "dismissed"
 
 
-class TestLLMGeneration:
-    """LLM-based generation (mocked)."""
+class TestResponseParsing:
+    """LLM response parsing (shared across providers)."""
 
-    def test_no_api_key_returns_empty(self):
-        with patch.dict("os.environ", {}, clear=True):
-            # Remove ANTHROPIC_API_KEY if present
-            import os
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            goals = cortex.generate_goals_llm({}, "None")
+    def test_parse_json_in_markdown_fence(self):
+        content = '```json\n[{"title": "test", "priority": 3, "description": "d", "reasoning": "r"}]\n```'
+        goals = cortex._parse_llm_response(content)
+        assert len(goals) == 1
+        assert goals[0].title == "test"
+
+    def test_parse_bare_json(self):
+        content = '[{"title": "test", "priority": 5, "description": "d", "reasoning": "r"}]'
+        goals = cortex._parse_llm_response(content)
+        assert len(goals) == 1
+
+    def test_parse_single_goal_object(self):
+        """Some models return a single object instead of an array."""
+        content = '{"title": "solo goal", "priority": 3, "description": "d", "reasoning": "r"}'
+        goals = cortex._parse_llm_response(content)
+        assert len(goals) == 1
+        assert goals[0].title == "solo goal"
+
+    def test_parse_invalid_json_raises(self):
+        with pytest.raises(Exception):
+            cortex._parse_llm_response("not json at all")
+
+
+class TestOllamaGeneration:
+    """Ollama (local, free) provider."""
+
+    def test_ollama_success(self):
+        mock_response = json.dumps([
+            {"title": "Optimize disk usage", "priority": 4,
+             "description": "Disk at 80%", "reasoning": "Preventive"}
+        ])
+        mock_data = {"message": {"content": f"```json\n{mock_response}\n```"}}
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.read.return_value = json.dumps(mock_data).encode()
+            goals = cortex.generate_goals_ollama({}, "None")
+
+        assert len(goals) == 1
+        assert goals[0].title == "Optimize disk usage"
+        assert goals[0].source == "llm"
+
+    def test_ollama_not_running_returns_empty(self):
+        with patch("urllib.request.urlopen", side_effect=Exception("Connection refused")):
+            goals = cortex.generate_goals_ollama({}, "None")
             assert goals == []
 
-    def test_llm_parses_json_response(self):
-        """Mock a successful LLM response."""
+    def test_ollama_bad_response_returns_empty(self):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.read.return_value = b'{"message": {"content": "I cannot help"}}'
+            goals = cortex.generate_goals_ollama({}, "None")
+            assert goals == []
+
+
+class TestHaikuGeneration:
+    """Haiku (cheap cloud fallback) provider."""
+
+    def test_haiku_success(self):
         mock_response = json.dumps([
-            {"title": "Investigate memory usage", "priority": 5,
-             "description": "Memory trending up", "reasoning": "Preventive"}
+            {"title": "Check backup integrity", "priority": 3,
+             "description": "Verify backups", "reasoning": "Routine"}
         ])
         mock_data = {"content": [{"text": f"```json\n{mock_response}\n```"}]}
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
             with patch("urllib.request.urlopen") as mock_urlopen:
-                mock_urlopen.return_value.__enter__ = lambda s: s
-                mock_urlopen.return_value.__exit__ = lambda s, *a: None
                 mock_urlopen.return_value.read.return_value = json.dumps(mock_data).encode()
-                goals = cortex.generate_goals_llm({}, "None")
+                goals = cortex.generate_goals_haiku({}, "None")
 
         assert len(goals) == 1
-        assert goals[0].title == "Investigate memory usage"
-        assert goals[0].source == "llm"
+        assert goals[0].title == "Check backup integrity"
 
-    def test_llm_failure_returns_empty(self):
-        """LLM errors should fail gracefully, not crash."""
+    def test_haiku_no_api_key_returns_empty(self):
+        import os
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        goals = cortex.generate_goals_haiku({}, "None")
+        assert goals == []
+
+    def test_haiku_failure_returns_empty(self):
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            with patch("urllib.request.urlopen", side_effect=Exception("Connection refused")):
+            with patch("urllib.request.urlopen", side_effect=Exception("API error")):
+                goals = cortex.generate_goals_haiku({}, "None")
+                assert goals == []
+
+
+class TestLLMFallbackChain:
+    """Ollama → Haiku → empty fallback chain."""
+
+    def test_ollama_success_skips_haiku(self):
+        """When Ollama works, Haiku should not be called."""
+        with patch.object(cortex, "generate_goals_ollama",
+                          return_value=[cortex.Goal("from ollama", 3, "d", "r", "llm")]):
+            with patch.object(cortex, "generate_goals_haiku") as mock_haiku:
+                goals = cortex.generate_goals_llm({}, "None")
+                assert len(goals) == 1
+                assert goals[0].title == "from ollama"
+                mock_haiku.assert_not_called()
+
+    def test_ollama_fails_tries_haiku(self):
+        """When Ollama fails, should fall through to Haiku."""
+        with patch.object(cortex, "generate_goals_ollama", return_value=[]):
+            with patch.object(cortex, "generate_goals_haiku",
+                              return_value=[cortex.Goal("from haiku", 3, "d", "r", "llm")]):
+                goals = cortex.generate_goals_llm({}, "None")
+                assert len(goals) == 1
+                assert goals[0].title == "from haiku"
+
+    def test_both_fail_returns_empty(self):
+        """When both providers fail, return empty for pattern fallback."""
+        with patch.object(cortex, "generate_goals_ollama", return_value=[]):
+            with patch.object(cortex, "generate_goals_haiku", return_value=[]):
                 goals = cortex.generate_goals_llm({}, "None")
                 assert goals == []
 
@@ -186,6 +265,13 @@ class TestSecurity:
         row = anah_db.execute("SELECT * FROM generated_goals WHERE id = ?", (goal_id,)).fetchone()
         row_str = str(dict(row))
         assert "sk-ant-" not in row_str
+
+    def test_sql_injection_in_goal_title(self, anah_db):
+        """Malicious goal titles should be safely parameterized."""
+        evil = cortex.Goal("'; DROP TABLE generated_goals; --", 5, "desc", "reason", "pattern")
+        goal_id = cortex.log_goal(anah_db, evil)
+        count = anah_db.execute("SELECT COUNT(*) FROM generated_goals").fetchone()[0]
+        assert count == 1
 
     def test_sql_injection_in_goal_title(self, anah_db):
         """Malicious goal titles should be safely parameterized."""
