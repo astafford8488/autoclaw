@@ -18,13 +18,14 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent
 BRAINSTEM_DIR = SKILLS_DIR / "anah-brainstem" / "scripts"
 CEREBELLUM_DIR = SKILLS_DIR / "anah-cerebellum" / "scripts"
 CORTEX_DIR = SKILLS_DIR / "anah-cortex" / "scripts"
+EXECUTOR_DIR = SKILLS_DIR / "anah-executor" / "scripts"
 HIPPOCAMPUS_DIR = SKILLS_DIR / "anah-hippocampus" / "scripts"
 MEMORY_DIR = SKILLS_DIR / "anah-memory" / "scripts"
 
 ANAH_DIR = Path.home() / ".anah"
 
 # Add script dirs to path for imports
-for d in (BRAINSTEM_DIR, CEREBELLUM_DIR, CORTEX_DIR, HIPPOCAMPUS_DIR, MEMORY_DIR):
+for d in (BRAINSTEM_DIR, CEREBELLUM_DIR, CORTEX_DIR, EXECUTOR_DIR, HIPPOCAMPUS_DIR, MEMORY_DIR):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
@@ -83,6 +84,17 @@ def run_cortex(cerebellum_output: dict, generate: bool = True) -> dict:
     return {"enacted": enacted, "count": len(enacted)}
 
 
+def run_executor(limit: int = 5) -> dict:
+    """Execute queued tasks."""
+    import executor
+    db = executor.get_db()
+    results = executor.run_queue(db, limit=limit)
+    db.close()
+    succeeded = sum(1 for r in results if r.get("success"))
+    failed = sum(1 for r in results if not r.get("success"))
+    return {"processed": len(results), "succeeded": succeeded, "failed": failed, "results": results}
+
+
 def run_hippocampus(hours: float = 1.0) -> dict:
     """Evaluate recent tasks for skill extraction."""
     import hippocampus
@@ -100,7 +112,7 @@ def run_memory_status() -> dict:
 # ---------------------------------------------------------------------------
 # Cycle modes
 # ---------------------------------------------------------------------------
-def full_cycle(generate: bool = True, learn: bool = True) -> dict:
+def full_cycle(generate: bool = True, execute: bool = True, learn: bool = True) -> dict:
     """Run a complete heartbeat cycle through all organelles."""
     t0 = time.time()
     result = {"timestamp": t0, "cycle": "full"}
@@ -131,12 +143,18 @@ def full_cycle(generate: bool = True, learn: bool = True) -> dict:
         "queue": cerebellum_out["context"].get("queue", {}),
     }
 
-    # 3. Cortex — goal generation
+    # 3. Executor — process queued tasks before generating new ones
+    if execute:
+        print("[executor] Processing queued tasks...", file=sys.stderr)
+        exec_out = run_executor(limit=5)
+        result["executor"] = exec_out
+
+    # 4. Cortex — goal generation
     print("[cortex] Generating goals...", file=sys.stderr)
     cortex_out = run_cortex(cerebellum_out, generate=generate)
     result["cortex"] = cortex_out
 
-    # 4. Hippocampus — skill learning
+    # 5. Hippocampus — skill learning
     if learn:
         print("[hippocampus] Evaluating for skill extraction...", file=sys.stderr)
         hippo_out = run_hippocampus()
@@ -211,6 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("--watchdog", "-w", action="store_true", help="Quick L1-only watchdog")
     parser.add_argument("--status", "-s", action="store_true", help="Status overview of all organelles")
     parser.add_argument("--generate", "-g", action="store_true", help="Enable cortex goal generation")
+    parser.add_argument("--execute", "-e", action="store_true", help="Execute queued tasks")
     parser.add_argument("--no-learn", action="store_true", help="Skip hippocampus learning")
     args = parser.parse_args()
 
@@ -218,7 +237,7 @@ if __name__ == "__main__":
     load_env()
 
     if args.cycle:
-        result = full_cycle(generate=args.generate, learn=not args.no_learn)
+        result = full_cycle(generate=args.generate, execute=args.execute, learn=not args.no_learn)
         print(json.dumps(result, indent=2))
     elif args.watchdog:
         result = watchdog_cycle()
