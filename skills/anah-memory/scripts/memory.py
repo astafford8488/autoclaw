@@ -205,7 +205,11 @@ def save_trajectories(trajectories: list[dict], filename: str | None = None):
     TRAJECTORIES_DIR.mkdir(parents=True, exist_ok=True)
     if not filename:
         filename = f"trajectories_{int(time.time())}.json"
-    path = TRAJECTORIES_DIR / filename
+    # Sanitize filename — strip path components to prevent traversal
+    safe_name = Path(filename).name
+    if not safe_name:
+        safe_name = f"trajectories_{int(time.time())}.json"
+    path = TRAJECTORIES_DIR / safe_name
     path.write_text(json.dumps(trajectories, indent=2))
     return str(path)
 
