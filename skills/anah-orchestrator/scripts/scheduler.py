@@ -417,6 +417,37 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
                                backups_rotated=maint.get("rotation", {}).get("deleted", 0))
             except Exception as e:
                 log_structured("ERROR", "maintenance", f"Maintenance failed: {e}")
+
+            # Training: check if ready, compare, promote
+            try:
+                TRAINER_DIR = SCRIPTS_DIR.parent.parent / "anah-trainer" / "scripts"
+                sys.path.insert(0, str(TRAINER_DIR))
+                import trainer
+                train_result = trainer.run_training_if_ready()
+                if train_result.get("triggered"):
+                    log_structured("INFO", "training", "Training triggered",
+                                   examples=train_result.get("sft", {}).get("after_dedup", 0))
+                    write_notification("info", "Training Complete",
+                                       f"Trained on {train_result.get('sft', {}).get('after_dedup', 0)} examples")
+                    # A/B comparison
+                    eval_result = trainer.compare_models()
+                    log_structured("INFO", "training", f"A/B eval: tuned {eval_result['tuned_wins']}/{eval_result['total']} wins",
+                                   tuned_wins=eval_result["tuned_wins"])
+                    if eval_result.get("tuned_better"):
+                        promo = trainer.promote_model()
+                        if promo.get("promoted"):
+                            log_structured("INFO", "training", f"Model promoted to {promo['model']}")
+                            write_notification("info", "Model Promoted",
+                                               f"Tuned model promoted ({promo['eval_wins']}/5 wins)")
+                else:
+                    # Check for model reversion even when not training
+                    rev = trainer.check_model_reversion()
+                    if rev.get("reverted"):
+                        log_structured("WARN", "training", f"Model reverted: {rev['reason']}")
+                        write_notification("warning", "Model Reverted", rev["reason"])
+            except Exception as e:
+                log_structured("ERROR", "training", f"Training check failed: {e}")
+
             last_maintenance = now
 
         # Sleep in small increments so we can respond to Ctrl+C

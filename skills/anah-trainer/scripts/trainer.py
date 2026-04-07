@@ -250,6 +250,59 @@ PARAMETER num_predict 1024
 # ---------------------------------------------------------------------------
 # Training execution
 # ---------------------------------------------------------------------------
+def run_training_if_ready(model_name: str = "anah-tuned") -> dict:
+    """Check if training conditions are met and run if so.
+
+    Triggers when:
+    - >20 new trajectories since last train
+    - Last train was >24h ago (or never)
+    Returns dict with 'triggered' bool and reason or training results.
+    """
+    TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    last_train_file = TRAINING_DIR / "last_train.json"
+
+    # Check last train time
+    last_train_ts = 0
+    last_train_count = 0
+    if last_train_file.exists():
+        try:
+            lt = json.loads(last_train_file.read_text())
+            last_train_ts = lt.get("timestamp", 0)
+            last_train_count = lt.get("trajectory_count", 0)
+        except Exception:
+            pass
+
+    hours_since = (time.time() - last_train_ts) / 3600 if last_train_ts else float("inf")
+
+    # Count current trajectories
+    all_trajs = load_all_trajectories()
+    current_count = len(all_trajs)
+    new_trajs = current_count - last_train_count
+
+    # Check conditions
+    if new_trajs < 20 and hours_since < 24:
+        return {
+            "triggered": False,
+            "reason": f"Not ready: {new_trajs} new trajectories (need 20), {hours_since:.1f}h since last train (need 24h)",
+            "new_trajectories": new_trajs,
+            "hours_since_last": round(hours_since, 1),
+        }
+
+    # Run training
+    result = run_training(model_name)
+    result["triggered"] = True
+
+    # Record training run
+    last_train_file.write_text(json.dumps({
+        "timestamp": time.time(),
+        "trajectory_count": current_count,
+        "examples": result.get("sft", {}).get("after_dedup", 0),
+        "model_name": model_name,
+    }))
+
+    return result
+
+
 def run_training(model_name: str = "anah-tuned") -> dict:
     """Full training pipeline: prepare → create modelfile → build model."""
     results = {}
@@ -306,6 +359,220 @@ def run_training(model_name: str = "anah-tuned") -> dict:
         }
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# A/B Model comparison
+# ---------------------------------------------------------------------------
+AB_TEST_PROMPTS = [
+    {
+        "system": "You are ANAH's L5 goal generator. Generate 1-2 goals as a JSON array.",
+        "user": "System health: 85%, queue empty, no recent failures. Generate improvement goals.",
+    },
+    {
+        "system": "You are ANAH's L5 goal generator. Generate 1-2 goals as a JSON array.",
+        "user": "CPU at 90%, disk at 80%. Generate maintenance goals.",
+    },
+    {
+        "system": "You are ANAH's L5 goal generator. Generate 1-2 goals as a JSON array.",
+        "user": "Network check failed 5 times in the last hour. Generate diagnostic goals.",
+    },
+    {
+        "system": "You are ANAH's L5 goal generator. Generate 1-2 goals as a JSON array.",
+        "user": "System idle, health 100%, learned 3 skills. Generate self-improvement goals.",
+    },
+    {
+        "system": "You are ANAH's L5 goal generator. Generate 1-2 goals as a JSON array.",
+        "user": "Task completion rate dropped from 90% to 60%. Generate recovery goals.",
+    },
+]
+
+
+def _score_response(content: str) -> float:
+    """Score a model response for quality (0-1). Checks JSON parsability and goal relevance."""
+    if not content:
+        return 0.0
+    score = 0.0
+    # Check JSON parsability
+    try:
+        text = content
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+        data = json.loads(text.strip())
+        if isinstance(data, dict):
+            data = [data]
+        if isinstance(data, list) and len(data) > 0:
+            score += 0.4  # Valid JSON array
+            # Check goal structure
+            for item in data:
+                if isinstance(item, dict):
+                    if "title" in item:
+                        score += 0.2
+                    if "priority" in item:
+                        score += 0.1
+                    if "description" in item or "reasoning" in item:
+                        score += 0.1
+                    break  # Score first goal only
+    except (json.JSONDecodeError, IndexError):
+        # Not valid JSON but has content
+        if len(content) > 20:
+            score += 0.1
+    return min(score, 1.0)
+
+
+def _call_model(model: str, system: str, user: str) -> str | None:
+    """Call an Ollama model and return response content."""
+    import urllib.request
+    try:
+        body = json.dumps({
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=body,
+            headers={"content-type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=60)
+        data = json.loads(resp.read())
+        return data["message"]["content"]
+    except Exception:
+        return None
+
+
+def compare_models(base_model: str | None = None, tuned_model: str = "anah-tuned") -> dict:
+    """Run A/B comparison between base and tuned models."""
+    TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    base = base_model or OLLAMA_MODEL
+
+    results = []
+    for i, prompt in enumerate(AB_TEST_PROMPTS):
+        base_resp = _call_model(base, prompt["system"], prompt["user"])
+        tuned_resp = _call_model(tuned_model, prompt["system"], prompt["user"])
+
+        base_score = _score_response(base_resp)
+        tuned_score = _score_response(tuned_resp)
+
+        results.append({
+            "prompt_idx": i,
+            "base_score": base_score,
+            "tuned_score": tuned_score,
+            "winner": "tuned" if tuned_score > base_score else "base" if base_score > tuned_score else "tie",
+        })
+
+    tuned_wins = sum(1 for r in results if r["winner"] == "tuned")
+    base_wins = sum(1 for r in results if r["winner"] == "base")
+    ties = sum(1 for r in results if r["winner"] == "tie")
+
+    eval_result = {
+        "base_model": base,
+        "tuned_model": tuned_model,
+        "results": results,
+        "tuned_wins": tuned_wins,
+        "base_wins": base_wins,
+        "ties": ties,
+        "total": len(results),
+        "tuned_better": tuned_wins >= 3,
+        "timestamp": time.time(),
+    }
+
+    # Save eval results
+    eval_file = TRAINING_DIR / "eval_results.json"
+    eval_file.write_text(json.dumps(eval_result, indent=2))
+
+    return eval_result
+
+
+def promote_model(tuned_model: str = "anah-tuned") -> dict:
+    """Promote tuned model if it scored better in A/B comparison."""
+    eval_file = TRAINING_DIR / "eval_results.json"
+    if not eval_file.exists():
+        return {"promoted": False, "reason": "No eval results. Run --compare first."}
+
+    eval_data = json.loads(eval_file.read_text())
+    if not eval_data.get("tuned_better"):
+        return {"promoted": False, "reason": f"Tuned model not better (wins: {eval_data.get('tuned_wins', 0)}/5)"}
+
+    # Update state.json with new model
+    state_file = ANAH_DIR / "state.json"
+    state = {}
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text())
+        except Exception:
+            pass
+    state["ollama_model"] = tuned_model
+    state_file.write_text(json.dumps(state, indent=2))
+
+    # Also update environment for current process
+    os.environ["OLLAMA_MODEL"] = tuned_model
+
+    return {
+        "promoted": True,
+        "model": tuned_model,
+        "eval_wins": eval_data.get("tuned_wins", 0),
+    }
+
+
+def check_model_reversion() -> dict:
+    """Revert to base model if tuned model produces 0 valid goals for 3 consecutive cycles."""
+    state_file = ANAH_DIR / "state.json"
+    if not state_file.exists():
+        return {"reverted": False, "reason": "No state file"}
+
+    state = json.loads(state_file.read_text())
+    current_model = state.get("ollama_model", OLLAMA_MODEL)
+
+    if current_model == OLLAMA_MODEL:
+        return {"reverted": False, "reason": "Already on base model"}
+
+    # Check recent goal generation from DB
+    try:
+        import sqlite3
+        db = sqlite3.connect(str(ANAH_DIR / "anah.db"))
+        db.row_factory = sqlite3.Row
+        # Get last 3 LLM-generated goals
+        rows = db.execute(
+            "SELECT source FROM generated_goals WHERE source = 'llm' ORDER BY timestamp DESC LIMIT 3"
+        ).fetchall()
+        db.close()
+
+        # If we have at least 3 cycles but 0 LLM goals, revert
+        # Actually check if recent cycles produced goals
+        reversion_file = ANAH_DIR / "training" / "zero_goal_count.json"
+        zero_count = 0
+        if reversion_file.exists():
+            try:
+                zero_count = json.loads(reversion_file.read_text()).get("count", 0)
+            except Exception:
+                pass
+
+        if len(rows) == 0:
+            zero_count += 1
+            reversion_file.parent.mkdir(parents=True, exist_ok=True)
+            reversion_file.write_text(json.dumps({"count": zero_count}))
+
+            if zero_count >= 3:
+                # Revert
+                state["ollama_model"] = OLLAMA_MODEL
+                state_file.write_text(json.dumps(state, indent=2))
+                os.environ["OLLAMA_MODEL"] = OLLAMA_MODEL
+                reversion_file.write_text(json.dumps({"count": 0}))
+                return {"reverted": True, "model": OLLAMA_MODEL, "reason": f"{zero_count} consecutive cycles with 0 LLM goals"}
+        else:
+            # Reset counter on success
+            if reversion_file.exists():
+                reversion_file.write_text(json.dumps({"count": 0}))
+
+        return {"reverted": False, "zero_goal_cycles": zero_count}
+    except Exception as e:
+        return {"reverted": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +637,10 @@ if __name__ == "__main__":
     parser.add_argument("--prepare-dpo", action="store_true", help="Build DPO dataset from paired trajectories")
     parser.add_argument("--create-modelfile", action="store_true", help="Generate Ollama Modelfile")
     parser.add_argument("--train", action="store_true", help="Full pipeline: prepare + create + train")
+    parser.add_argument("--train-if-ready", action="store_true", help="Train only if conditions met (>20 new trajs, >24h)")
+    parser.add_argument("--compare", action="store_true", help="A/B compare base vs tuned model")
+    parser.add_argument("--promote", action="store_true", help="Promote tuned model if it scored better")
+    parser.add_argument("--check-reversion", action="store_true", help="Revert to base if tuned produces 0 goals")
     parser.add_argument("--stats", action="store_true", help="Show dataset statistics")
     parser.add_argument("--model-name", type=str, default="anah-tuned", help="Name for the fine-tuned model")
     parser.add_argument("--base-model", type=str, help="Base model to fine-tune from")
@@ -388,5 +659,17 @@ if __name__ == "__main__":
     elif args.train:
         result = run_training(args.model_name)
         print(json.dumps(result, indent=2, default=str))
+    elif args.train_if_ready:
+        result = run_training_if_ready(args.model_name)
+        print(json.dumps(result, indent=2, default=str))
+    elif args.compare:
+        result = compare_models(args.base_model, args.model_name)
+        print(json.dumps(result, indent=2))
+    elif args.promote:
+        result = promote_model(args.model_name)
+        print(json.dumps(result, indent=2))
+    elif args.check_reversion:
+        result = check_model_reversion()
+        print(json.dumps(result, indent=2))
     else:
         parser.print_help()
