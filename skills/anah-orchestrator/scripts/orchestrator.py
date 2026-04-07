@@ -109,6 +109,19 @@ def run_memory_status() -> dict:
     return memory.memory_status()
 
 
+def run_trajectory_export() -> dict:
+    """Export recent completed task trajectories to disk."""
+    import memory
+    try:
+        trajectories = memory.export_trajectories(since_hours=1, limit=50)
+        if trajectories:
+            path = memory.save_trajectories(trajectories)
+            return {"exported": len(trajectories), "path": path}
+        return {"exported": 0}
+    except Exception as e:
+        return {"exported": 0, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Cycle modes
 # ---------------------------------------------------------------------------
@@ -160,6 +173,11 @@ def full_cycle(generate: bool = True, execute: bool = True, learn: bool = True) 
         print("[hippocampus] Evaluating for skill extraction...", file=sys.stderr)
         hippo_out = run_hippocampus()
         result["hippocampus"] = hippo_out
+
+    # 6. Trajectory export — save completed task traces for training
+    print("[memory] Exporting trajectories...", file=sys.stderr)
+    traj_out = run_trajectory_export()
+    result["trajectories"] = traj_out
 
     result["duration_ms"] = (time.time() - t0) * 1000
     return result
