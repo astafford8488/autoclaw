@@ -9,7 +9,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "anah-notify" / "scripts"))
-import discord as discord_notify
+import discord_webhook as discord_notify
 
 
 class TestEmbedBuilders:
@@ -90,17 +90,17 @@ class TestSendWebhook:
         mock_resp.status = 204
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
-        with patch("discord.urllib.request.urlopen", return_value=mock_resp):
+        with patch("discord_webhook.urllib.request.urlopen", return_value=mock_resp):
             assert discord_notify.send_webhook("https://example.com/webhook", {"content": "test"})
 
     def test_send_http_error(self):
         import urllib.error
-        with patch("discord.urllib.request.urlopen",
+        with patch("discord_webhook.urllib.request.urlopen",
                    side_effect=urllib.error.HTTPError("url", 429, "rate limited", {}, None)):
             assert not discord_notify.send_webhook("https://example.com/webhook", {})
 
     def test_send_network_error(self):
-        with patch("discord.urllib.request.urlopen", side_effect=ConnectionError("timeout")):
+        with patch("discord_webhook.urllib.request.urlopen", side_effect=ConnectionError("timeout")):
             assert not discord_notify.send_webhook("https://example.com/webhook", {})
 
 

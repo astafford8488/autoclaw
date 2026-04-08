@@ -35,7 +35,7 @@ import orchestrator
 NOTIFY_DIR = Path(__file__).resolve().parent.parent.parent / "anah-notify" / "scripts"
 sys.path.insert(0, str(NOTIFY_DIR))
 try:
-    import discord as discord_notify
+    import discord_webhook as discord_notify
 except ImportError:
     discord_notify = None
 

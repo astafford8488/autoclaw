@@ -491,7 +491,7 @@ def handle_notify(task: dict) -> TaskResult:
         try:
             if str(NOTIFY_DIR) not in sys.path:
                 sys.path.insert(0, str(NOTIFY_DIR))
-            import discord as discord_notify
+            import discord_webhook as discord_notify
             discord_sent = discord_notify.send_notification(level, title, desc, source="executor")
         except Exception:
             pass
