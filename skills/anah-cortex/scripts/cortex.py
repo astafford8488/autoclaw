@@ -16,7 +16,8 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 ANAH_DIR = Path.home() / ".anah"
@@ -45,18 +46,22 @@ The hierarchy:
 - L4: task metrics, pattern detection
 - L5: YOU — goal generation, planning, self-improvement
 
+STRATEGIC INSIGHTS (from metacognition — take these seriously):
+{strategy}
+
 Consider:
 1. What areas need attention? (failing checks, degrading performance, idle resources)
 2. What has been tried recently and failed? (avoid repeating failures)
 3. What handler types have good success rates? (leverage strengths)
 4. What learned skills are available? (use existing capabilities)
+5. What do the strategic insights recommend? (avoid/leverage/gaps)
 
 Respond with a brief JSON analysis:
-{
+{{
   "needs": ["list of 1-3 system needs"],
-  "avoid": ["topics to avoid based on recent failures"],
+  "avoid": ["topics to avoid based on recent failures and strategy"],
   "leverage": ["strengths or skills to build on"]
-}"""
+}}"""
 
 GENERATION_PROMPT = """You are ANAH's L5 Goal Generation engine — the autonomous reasoning layer (cortex) of a self-directed agent hierarchy.
 
@@ -71,12 +76,23 @@ HANDLER SUCCESS RATES (use high-success handlers, avoid consistently failing one
 AVAILABLE LEARNED SKILLS (leverage these where relevant):
 {skills}
 
+AVAILABLE MCP TOOLS (use "mcp:" prefix to invoke external tools):
+{mcp_tools}
+
 IMPORTANT: You will receive a list of recently generated goals. DO NOT propose similar goals.
 Generate 1-3 specific, actionable tasks as a JSON array. Each task:
-- title: descriptive action title (prefix with handler type like "health_report:", "self_diagnostic:", "cleanup:")
+- title: descriptive action title (prefix with handler type like "health_report:", "self_diagnostic:", "cleanup:", "mcp:")
 - priority: 0-9 (higher = more urgent)
 - description: what to accomplish
 - reasoning: why this is valuable now
+
+For MULTI-STEP plans, add chain fields:
+- chain: true (marks this response as a chain)
+- steps: array of tasks with "step" (1,2,3...) and optional "depends_on" (step number)
+Example chain: {{"chain": true, "steps": [{{"step":1,"title":"research X","priority":5,"description":"...","reasoning":"..."}},{{"step":2,"title":"implement Y","priority":5,"description":"...","reasoning":"...","depends_on":1}}]}}
+
+Use chains when a task naturally requires sequential steps (research then implement, analyze then fix, etc).
+Single independent tasks should still be returned as a plain JSON array.
 
 If the system is healthy and idle, generate exploratory or self-improvement tasks."""
 
@@ -113,6 +129,9 @@ class Goal:
     description: str
     reasoning: str
     source: str  # "llm" or "pattern"
+    chain_id: str | None = None
+    chain_step: int | None = None
+    depends_on_goal_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +154,14 @@ def log_goal(db: sqlite3.Connection, goal: Goal, context: dict | None = None,
              topic_hash: str | None = None, expires_at: float | None = None) -> int:
     cursor = db.execute(
         """INSERT INTO generated_goals
-           (timestamp, title, priority, description, reasoning, source, context, status, topic_hash, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (timestamp, title, priority, description, reasoning, source, context, status,
+            topic_hash, expires_at, chain_id, chain_step, depends_on_goal_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (time.time(), goal.title, goal.priority, goal.description, goal.reasoning,
          goal.source, json.dumps(context) if context else None,
          'pending_approval' if GOAL_APPROVAL else 'proposed',
-         topic_hash, expires_at),
+         topic_hash, expires_at,
+         goal.chain_id, goal.chain_step, goal.depends_on_goal_id),
     )
     db.commit()
     return cursor.lastrowid
@@ -219,6 +240,39 @@ def check_expired_approvals(db: sqlite3.Connection) -> dict:
             dismiss_goal(db, row["id"])
             dismissed += 1
     return {"enacted": enacted, "dismissed": dismissed}
+
+
+def check_chain_promotions(db: sqlite3.Connection) -> dict:
+    """Promote waiting chain steps whose dependencies have completed (enacted + task completed).
+    Called after executor finishes tasks to advance chains."""
+    promoted = 0
+    waiting = db.execute(
+        "SELECT * FROM generated_goals WHERE status = 'waiting' AND depends_on_goal_id IS NOT NULL"
+    ).fetchall()
+    for row in waiting:
+        row = dict(row)
+        dep_id = row["depends_on_goal_id"]
+        # Check if dependency goal's task is completed
+        dep = db.execute(
+            "SELECT g.task_id, t.status as task_status FROM generated_goals g "
+            "LEFT JOIN task_queue t ON g.task_id = t.id "
+            "WHERE g.id = ?", (dep_id,)
+        ).fetchone()
+        if dep and dep["task_status"] == "completed":
+            # Dependency done — enqueue this step
+            goal = Goal(
+                title=row["title"], priority=row["priority"],
+                description=row.get("description", ""), reasoning=row.get("reasoning", ""),
+                source=row["source"],
+                chain_id=row.get("chain_id"), chain_step=row.get("chain_step"),
+                depends_on_goal_id=dep_id,
+            )
+            enqueue_task(db, goal, row["id"])
+            promoted += 1
+        elif dep and dep["task_status"] == "failed":
+            # Dependency failed — dismiss this step
+            dismiss_goal(db, row["id"])
+    return {"promoted": promoted}
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +404,72 @@ def format_skills(skills: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP tool registry for cortex awareness
+# ---------------------------------------------------------------------------
+MCP_TOOL_WHITELIST = [
+    {"name": "web_search", "description": "Search the web for information", "example": "mcp: web_search best practices SQLite optimization"},
+    {"name": "web_fetch", "description": "Fetch and read a web page URL", "example": "mcp: web_fetch https://docs.example.com/guide"},
+    {"name": "slack_send_message", "description": "Send a message to a Slack channel", "example": "mcp: slack_send_message #general System update complete"},
+    {"name": "slack_search_public", "description": "Search Slack messages", "example": "mcp: slack_search_public deployment issues"},
+    {"name": "notion_search", "description": "Search Notion pages and databases", "example": "mcp: notion_search project roadmap"},
+    {"name": "gmail_search_messages", "description": "Search Gmail messages", "example": "mcp: gmail_search_messages from:alerts subject:error"},
+    {"name": "gcal_list_events", "description": "List upcoming Google Calendar events", "example": "mcp: gcal_list_events"},
+]
+
+
+def format_mcp_tools() -> str:
+    """Format available MCP tools for prompt injection."""
+    if not MCP_TOOL_WHITELIST:
+        return "No external tools available."
+    lines = []
+    for t in MCP_TOOL_WHITELIST:
+        lines.append(f"- {t['name']}: {t['description']} (e.g. \"{t['example']}\")")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Chain parsing
+# ---------------------------------------------------------------------------
+def _parse_chain_response(data: dict | list) -> list[Goal]:
+    """Parse a chain response into linked Goal objects."""
+    if isinstance(data, list):
+        # Not a chain — regular goal list
+        return [Goal(
+            title=t["title"], priority=t.get("priority", 3),
+            description=t.get("description", ""), reasoning=t.get("reasoning", ""),
+            source="llm",
+        ) for t in data]
+
+    if isinstance(data, dict) and data.get("chain"):
+        steps = data.get("steps", [])
+        if not steps:
+            return []
+        chain_id = uuid.uuid4().hex[:12]
+        # Map step numbers to goals (we'll resolve depends_on after logging)
+        goals = []
+        for s in steps:
+            goals.append(Goal(
+                title=s["title"], priority=s.get("priority", 3),
+                description=s.get("description", ""), reasoning=s.get("reasoning", ""),
+                source="llm",
+                chain_id=chain_id,
+                chain_step=s.get("step", len(goals) + 1),
+                # Store raw depends_on step number — resolved to goal_id during logging
+                depends_on_goal_id=s.get("depends_on"),
+            ))
+        return goals
+
+    # Single goal dict
+    if isinstance(data, dict) and "title" in data:
+        return [Goal(
+            title=data["title"], priority=data.get("priority", 3),
+            description=data.get("description", ""), reasoning=data.get("reasoning", ""),
+            source="llm",
+        )]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # LLM generation — Ollama (primary) → Haiku (fallback)
 # ---------------------------------------------------------------------------
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -358,20 +478,14 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
 def _parse_llm_response(content: str) -> list[Goal]:
-    """Extract goals from LLM response text (handles markdown fences)."""
+    """Extract goals from LLM response text (handles markdown fences and chains)."""
     if "```json" in content:
         content = content.split("```json")[1].split("```")[0]
     elif "```" in content:
         content = content.split("```")[1].split("```")[0]
 
-    tasks = json.loads(content.strip())
-    if isinstance(tasks, dict):
-        tasks = [tasks]  # Single goal returned without array wrapper
-    return [Goal(
-        title=t["title"], priority=t.get("priority", 3),
-        description=t.get("description", ""), reasoning=t.get("reasoning", ""),
-        source="llm",
-    ) for t in tasks]
+    data = json.loads(content.strip())
+    return _parse_chain_response(data)
 
 
 def _parse_analysis_response(content: str) -> dict:
@@ -448,15 +562,22 @@ def _build_user_message(context: dict, recent_goals_text: str) -> str:
 def generate_goals_twophase(context: dict, recent_goals_text: str,
                              success_rates: dict, skills: list[dict]) -> list[Goal]:
     """Two-phase generation: analyze needs → generate targeted goals."""
-    # Phase 1: Analysis
+    # Phase 1: Analysis — inject metacognition strategy insights
+    try:
+        from metacognition import get_strategy_for_cortex
+        strategy_text = get_strategy_for_cortex()
+    except Exception:
+        strategy_text = "No strategic insights available."
+
+    analysis_system = ANALYSIS_PROMPT.format(strategy=strategy_text)
     analysis_user = f"System state:\n{json.dumps(context, indent=2)}\n\nRecent goals:\n{recent_goals_text}"
     analysis_content = _call_ollama([
-        {"role": "system", "content": ANALYSIS_PROMPT},
+        {"role": "system", "content": analysis_system},
         {"role": "user", "content": analysis_user},
     ], timeout=30)
 
     if not analysis_content:
-        analysis_content = _call_haiku(ANALYSIS_PROMPT, analysis_user)
+        analysis_content = _call_haiku(analysis_system, analysis_user)
 
     analysis = _parse_analysis_response(analysis_content) if analysis_content else {
         "needs": ["general system health check"], "avoid": [], "leverage": []
@@ -467,6 +588,7 @@ def generate_goals_twophase(context: dict, recent_goals_text: str,
         analysis=json.dumps(analysis, indent=2),
         success_rates=format_success_rates(success_rates),
         skills=format_skills(skills),
+        mcp_tools=format_mcp_tools(),
     )
     gen_user = _build_user_message(context, recent_goals_text)
 
@@ -594,11 +716,25 @@ def run_generation(context: dict, patterns: list[dict]) -> list[dict]:
     goals = dedup_goals(goals, recent)
 
     # Log and optionally enqueue
+    # For chains: map step numbers → goal IDs so depends_on resolves correctly
     results = []
+    step_to_goal_id: dict[tuple[str, int], int] = {}  # (chain_id, step) → goal_id
+
     for goal in goals:
         topic_hash = compute_topic_hash(goal.title)
         expires_at = compute_expiry(goal.priority) if GOAL_APPROVAL else None
+
+        # Resolve depends_on from step number to actual goal_id
+        if goal.chain_id and goal.depends_on_goal_id is not None:
+            dep_step = goal.depends_on_goal_id  # This is still a step number
+            resolved_id = step_to_goal_id.get((goal.chain_id, dep_step))
+            goal.depends_on_goal_id = resolved_id  # Now it's a real goal_id (or None)
+
         goal_id = log_goal(db, goal, context, topic_hash=topic_hash, expires_at=expires_at)
+
+        # Track step→goal_id mapping for chain resolution
+        if goal.chain_id and goal.chain_step is not None:
+            step_to_goal_id[(goal.chain_id, goal.chain_step)] = goal_id
 
         if GOAL_APPROVAL:
             # Goals wait for approval (or auto-expire)
@@ -609,13 +745,24 @@ def run_generation(context: dict, patterns: list[dict]) -> list[dict]:
                 "topic_hash": topic_hash,
             })
         else:
-            # Immediately enqueue
-            task_id = enqueue_task(db, goal, goal_id)
-            results.append({
-                **asdict(goal), "goal_id": goal_id, "task_id": task_id,
-                "status": "enacted",
-                "topic_hash": topic_hash,
-            })
+            # Chain steps with unmet dependencies stay proposed (not enqueued yet)
+            if goal.depends_on_goal_id is not None:
+                # Don't enqueue — executor will pick it up when dependency completes
+                db.execute("UPDATE generated_goals SET status = 'waiting' WHERE id = ?", (goal_id,))
+                db.commit()
+                results.append({
+                    **asdict(goal), "goal_id": goal_id,
+                    "status": "waiting",
+                    "topic_hash": topic_hash,
+                })
+            else:
+                # No dependency — enqueue immediately
+                task_id = enqueue_task(db, goal, goal_id)
+                results.append({
+                    **asdict(goal), "goal_id": goal_id, "task_id": task_id,
+                    "status": "enacted",
+                    "topic_hash": topic_hash,
+                })
 
     db.close()
     return results

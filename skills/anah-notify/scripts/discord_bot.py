@@ -138,10 +138,26 @@ if HAS_DISCORD:
             self.approval_channel_id = None
 
         async def setup_hook(self):
-            """Register slash commands and start background tasks."""
+            """Register slash commands, restore persistent views, and start background tasks."""
             self.approval_channel_id = os.environ.get("DISCORD_APPROVAL_CHANNEL_ID")
             if self.approval_channel_id:
                 self.approval_channel_id = int(self.approval_channel_id)
+
+            # Re-register persistent views for any pending goals with discord messages
+            # This is what makes buttons survive bot restarts
+            try:
+                db = get_db()
+                pending = db.execute(
+                    "SELECT id FROM generated_goals "
+                    "WHERE status = 'pending_approval' AND discord_message_id IS NOT NULL"
+                ).fetchall()
+                db.close()
+                for row in pending:
+                    self.add_view(GoalApprovalView(row["id"]))
+                if pending:
+                    print(f"[discord_bot] Restored {len(pending)} persistent approval views", file=sys.stderr)
+            except Exception as e:
+                print(f"[discord_bot] Could not restore views: {e}", file=sys.stderr)
 
             # Register commands
             _register_commands(self.tree)
@@ -156,10 +172,29 @@ if HAS_DISCORD:
 
         @tasks.loop(seconds=30)
         async def check_expiry_loop(self):
-            """Periodically check for expired goal approvals."""
+            """Periodically check for expired goal approvals and post un-posted proposals."""
             try:
                 import cortex
                 db = get_db()
+
+                # Post any pending_approval goals that haven't been posted to Discord yet
+                if self.approval_channel_id:
+                    unposted = db.execute(
+                        "SELECT * FROM generated_goals "
+                        "WHERE status = 'pending_approval' AND discord_message_id IS NULL "
+                        "ORDER BY priority DESC LIMIT 5"
+                    ).fetchall()
+                    for row in unposted:
+                        goal = dict(row)
+                        try:
+                            await self.post_goal_proposal(goal)
+                            print(f"[discord_bot] Posted goal #{goal['id']} to approval channel",
+                                  file=sys.stderr)
+                        except Exception as e:
+                            print(f"[discord_bot] Failed to post goal #{goal['id']}: {e}",
+                                  file=sys.stderr)
+
+                # Check expired approvals
                 result = cortex.check_expired_approvals(db)
                 db.close()
                 if result["enacted"] or result["dismissed"]:
@@ -217,14 +252,32 @@ if HAS_DISCORD:
 
 
     class GoalApprovalView(discord.ui.View):
-        """Buttons for approving/dismissing a goal."""
+        """Buttons for approving/dismissing a goal.
+
+        Uses dynamic custom_id with goal_id prefix so views survive bot restarts.
+        Discord.py persistent views require: timeout=None + custom_id on every item.
+        """
 
         def __init__(self, goal_id: int):
             super().__init__(timeout=None)  # Persistent view
             self.goal_id = goal_id
 
-        @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, emoji=None)
-        async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            # Build buttons with dynamic custom_id (required for persistence)
+            approve_btn = discord.ui.Button(
+                label="Approve", style=discord.ButtonStyle.green,
+                custom_id=f"anah_approve_{goal_id}",
+            )
+            approve_btn.callback = self.approve_callback
+            self.add_item(approve_btn)
+
+            dismiss_btn = discord.ui.Button(
+                label="Dismiss", style=discord.ButtonStyle.red,
+                custom_id=f"anah_dismiss_{goal_id}",
+            )
+            dismiss_btn.callback = self.dismiss_callback
+            self.add_item(dismiss_btn)
+
+        async def approve_callback(self, interaction: discord.Interaction):
             try:
                 import cortex
                 db = get_db()
@@ -233,7 +286,6 @@ if HAS_DISCORD:
                 if "error" in result:
                     await interaction.response.send_message(f"Error: {result['error']}", ephemeral=True)
                 else:
-                    # Edit the original message
                     embed = interaction.message.embeds[0] if interaction.message.embeds else None
                     if embed:
                         embed.color = 0x57F287
@@ -244,8 +296,7 @@ if HAS_DISCORD:
             except Exception as e:
                 await interaction.response.send_message(f"Error: {e}", ephemeral=True)
 
-        @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.red, emoji=None)
-        async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def dismiss_callback(self, interaction: discord.Interaction):
             try:
                 import cortex
                 db = get_db()

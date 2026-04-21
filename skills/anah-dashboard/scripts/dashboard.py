@@ -335,12 +335,40 @@ def api_logs() -> dict:
     entries = []
     if log_file.exists():
         lines = log_file.read_text().strip().splitlines()
-        for line in lines[-30:]:
+        for line in lines[-50:]:
             try:
                 entries.append(json.loads(line))
             except Exception:
                 continue
     return {"entries": entries, "count": len(entries)}
+
+
+def api_suppressed() -> dict:
+    """Get recent suppressed (hallucinated) alerts from task results."""
+    db = get_db()
+    rows = db.execute(
+        """SELECT id, title, result, completed_at FROM task_queue
+           WHERE status = 'completed' AND result LIKE '%suppressed%'
+           ORDER BY completed_at DESC LIMIT 50"""
+    ).fetchall()
+    db.close()
+    suppressed = []
+    for r in rows:
+        r = dict(r)
+        try:
+            result = json.loads(r["result"])
+            if result.get("suppressed"):
+                suppressed.append({
+                    "id": r["id"],
+                    "title": r["title"],
+                    "claimed": result.get("claimed", ""),
+                    "actual": result.get("actual", ""),
+                    "reason": result.get("reason", ""),
+                    "timestamp": r["completed_at"],
+                })
+        except Exception:
+            continue
+    return {"suppressed": suppressed, "count": len(suppressed)}
 
 
 def api_overview() -> dict:
@@ -378,6 +406,7 @@ API_ROUTES = {
     "/api/memory": api_memory,
     "/api/trajectories": api_trajectories,
     "/api/logs": api_logs,
+    "/api/suppressed": api_suppressed,
     "/api/overview": api_overview,
 }
 
@@ -412,7 +441,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-bottom: 12px; }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
   .stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
-  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; flex: 1; min-width: 100px; text-align: center; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; flex: 1; min-width: 90px; text-align: center; }
   .stat-value { font-size: 1.8em; font-weight: bold; }
   .stat-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; }
   .green { color: var(--green); } .yellow { color: var(--yellow); } .red { color: var(--red); } .purple { color: var(--purple); }
@@ -420,12 +449,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-weight: 500; }
   td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
   .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 500; display: inline-block; }
-  .badge-green { background: #238636; color: #fff; }
-  .badge-yellow { background: #9e6a03; color: #fff; }
-  .badge-red { background: #da3633; color: #fff; }
-  .badge-blue { background: #1f6feb; color: #fff; }
-  .badge-purple { background: #8957e5; color: #fff; }
-  .badge-gray { background: #30363d; color: var(--text-dim); }
+  .badge-green { background: #238636; color: #fff; } .badge-yellow { background: #9e6a03; color: #fff; }
+  .badge-red { background: #da3633; color: #fff; } .badge-blue { background: #1f6feb; color: #fff; }
+  .badge-purple { background: #8957e5; color: #fff; } .badge-gray { background: #30363d; color: var(--text-dim); }
   .gauge { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 4px; }
   .gauge-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
   .bar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -433,16 +459,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .bar-value { font-size: 0.8em; min-width: 50px; text-align: right; }
   .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
   button { background: var(--accent); color: #fff; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
-  button:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.5; cursor: default; }
+  button:hover { opacity: 0.85; } button:disabled { opacity: 0.5; cursor: default; }
   .btn-sm { padding: 2px 8px; font-size: 0.75em; border-radius: 4px; }
-  .btn-green { background: #238636; }
-  .btn-red { background: #da3633; }
-  .btn-gray { background: #30363d; color: var(--text-dim); }
+  .btn-green { background: #238636; } .btn-red { background: #da3633; } .btn-gray { background: #30363d; color: var(--text-dim); }
   .refresh-note { font-size: 0.75em; color: var(--text-dim); }
   .sse-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
-  .sse-connected { background: var(--green); }
-  .sse-disconnected { background: var(--red); }
+  .sse-connected { background: var(--green); } .sse-disconnected { background: var(--red); }
   .level-row { display: flex; gap: 8px; margin-bottom: 4px; align-items: center; }
   .level-dot { width: 10px; height: 10px; border-radius: 50%; }
   .level-name { font-size: 0.85em; min-width: 30px; }
@@ -453,9 +475,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .sparkline { display: block; margin: 4px 0; }
   .expiry-bar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 3px; }
   .expiry-fill { height: 100%; border-radius: 2px; background: var(--yellow); transition: width 1s linear; }
-  #loading { color: var(--text-dim); font-style: italic; }
   .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
   .pagination button { padding: 4px 10px; }
+  .show-more { color: var(--accent); cursor: pointer; font-size: 0.8em; padding: 6px 0; display: block; text-align: center; }
+  .show-more:hover { text-decoration: underline; }
+  /* Tabs */
+  .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 18px; cursor: pointer; font-size: 0.9em; color: var(--text-dim); border-bottom: 2px solid transparent; transition: all 0.2s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .suppressed-row { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.8em; }
+  .suppressed-claim { color: var(--red); text-decoration: line-through; }
+  .suppressed-actual { color: var(--green); }
 </style>
 </head>
 <body>
@@ -471,59 +504,86 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="stat-row" id="topStats"></div>
 
-<div class="grid">
-  <div class="card">
-    <h2>Health Status</h2>
-    <div id="healthPanel"><span id="loading">Loading...</span></div>
-    <div style="margin-top:8px"><h2 style="font-size:0.9em">Health Trend</h2><div id="sparkline"></div></div>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('overview')">Overview</div>
+  <div class="tab" onclick="switchTab('tasks')">Tasks</div>
+  <div class="tab" onclick="switchTab('goals')">Goals</div>
+  <div class="tab" onclick="switchTab('skills')">Skills</div>
+  <div class="tab" onclick="switchTab('logs')">Logs</div>
+</div>
+
+<!-- OVERVIEW TAB -->
+<div id="tab-overview" class="tab-content active">
+  <div class="grid">
+    <div class="card">
+      <h2>Health Status</h2>
+      <div id="healthPanel">Loading...</div>
+      <div style="margin-top:8px"><h2 style="font-size:0.9em">Health Trend</h2><div id="sparkline"></div></div>
+    </div>
+    <div class="card">
+      <h2>Memory</h2>
+      <div id="memoryPanel"></div>
+    </div>
   </div>
-  <div class="card">
-    <h2>Memory</h2>
-    <div id="memoryPanel"></div>
+  <div class="grid">
+    <div class="card">
+      <h2>Training</h2>
+      <div id="trainingPanel"></div>
+    </div>
+    <div class="card">
+      <h2>Trajectories</h2>
+      <div id="trajPanel"></div>
+    </div>
   </div>
 </div>
 
-<div class="grid">
+<!-- TASKS TAB -->
+<div id="tab-tasks" class="tab-content">
   <div class="card">
     <h2>Task Queue</h2>
     <div id="queuePanel"></div>
   </div>
-  <div class="card">
-    <h2>Goals</h2>
-    <div id="goalsPanel"></div>
+</div>
+
+<!-- GOALS TAB -->
+<div id="tab-goals" class="tab-content">
+  <div class="grid">
+    <div class="card">
+      <h2>Active Goals</h2>
+      <div id="goalsPanel"></div>
+    </div>
+    <div class="card">
+      <h2>Goal History</h2>
+      <div id="goalHistoryPanel"></div>
+    </div>
   </div>
 </div>
 
-<div class="grid">
-  <div class="card">
-    <h2>Training</h2>
-    <div id="trainingPanel"></div>
-  </div>
-  <div class="card">
-    <h2>Trajectories</h2>
-    <div id="trajPanel"></div>
-  </div>
-</div>
-
-<div class="grid">
+<!-- SKILLS TAB -->
+<div id="tab-skills" class="tab-content">
   <div class="card">
     <h2>Learned Skills</h2>
     <div id="skillsPanel"></div>
   </div>
-  <div class="card">
-    <h2>Goal History</h2>
-    <div id="goalHistoryPanel"></div>
-  </div>
 </div>
 
-<div class="card" style="margin-bottom:12px">
-  <h2>Scheduler Log</h2>
-  <div id="logPanel" style="max-height:250px;overflow-y:auto;font-size:0.8em;font-family:monospace"></div>
+<!-- LOGS TAB -->
+<div id="tab-logs" class="tab-content">
+  <div class="grid">
+    <div class="card">
+      <h2>Scheduler Log</h2>
+      <div id="logPanel" style="max-height:400px;overflow-y:auto;font-size:0.8em;font-family:monospace"></div>
+    </div>
+    <div class="card">
+      <h2>Suppressed Alerts <span class="badge badge-red" style="font-size:0.7em">LLM Lies</span></h2>
+      <div id="suppressedPanel"></div>
+    </div>
+  </div>
 </div>
 
 <script>
 const statusBadge = (s) => {
-  const map = {completed:'green',queued:'blue',running:'yellow',failed:'red',pending_approval:'purple',enacted:'green',proposed:'blue',dismissed:'gray'};
+  const map = {completed:'green',queued:'blue',running:'yellow',failed:'red',pending_approval:'purple',enacted:'green',proposed:'blue',dismissed:'gray',suppressed:'red'};
   return '<span class="badge badge-'+(map[s]||'gray')+'">'+s+'</span>';
 };
 const scoreColor = (s) => s >= 80 ? 'green' : s >= 50 ? 'yellow' : 'red';
@@ -533,9 +593,22 @@ const ago = (ts) => {
   if (s < 0) return 'future';
   if (s < 60) return s + 's ago';
   if (s < 3600) return Math.floor(s/60) + 'm ago';
-  return Math.floor(s/3600) + 'h ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
 };
 const pct = (v, max) => max > 0 ? Math.round(v/max*100) : 0;
+
+// Tab switching
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelector('.tab[onclick*="'+name+'"]').classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+  // Load tab-specific data
+  if (name === 'logs') loadLogs();
+  if (name === 'skills') loadSkills();
+  if (name === 'goals') loadGoalHistory(goalHistoryPage);
+}
 
 // SSE
 let evtSource = null;
@@ -550,22 +623,21 @@ function connectSSE() {
     document.getElementById('sseStatus').textContent = 'Reconnecting...';
   };
   evtSource.addEventListener('refresh', () => refresh());
-  evtSource.addEventListener('goal_approved', (e) => { refresh(); });
-  evtSource.addEventListener('goal_dismissed', (e) => { refresh(); });
-  evtSource.addEventListener('cycle_complete', (e) => { refresh(); });
-  evtSource.addEventListener('heartbeat', () => {}); // Keep-alive
+  evtSource.addEventListener('goal_approved', () => refresh());
+  evtSource.addEventListener('goal_dismissed', () => refresh());
+  evtSource.addEventListener('cycle_complete', () => refresh());
+  evtSource.addEventListener('heartbeat', () => {});
 }
 
 function renderStats(d) {
-  const h = d.health, q = d.queue, g = d.goals, sk = d.skills;
+  const h = d.health, q = d.queue, g = d.goals;
   document.getElementById('topStats').innerHTML =
     '<div class="stat"><div class="stat-value '+scoreColor(h.health_score)+'">'+h.health_score+'%</div><div class="stat-label">Health</div></div>' +
     '<div class="stat"><div class="stat-value">'+q.total+'</div><div class="stat-label">Tasks</div></div>' +
     '<div class="stat"><div class="stat-value '+(q.counts.queued?'yellow':'')+'">'+( q.counts.queued||0)+'</div><div class="stat-label">Queued</div></div>' +
     '<div class="stat"><div class="stat-value green">'+(q.counts.completed||0)+'</div><div class="stat-label">Done</div></div>' +
     '<div class="stat"><div class="stat-value">'+(g.stats.total)+'</div><div class="stat-label">Goals</div></div>' +
-    '<div class="stat"><div class="stat-value purple">'+(g.stats.pending_approval||0)+'</div><div class="stat-label">Pending</div></div>' +
-    '<div class="stat"><div class="stat-value purple">'+(sk.count)+'</div><div class="stat-label">Skills</div></div>';
+    '<div class="stat"><div class="stat-value purple">'+(g.stats.pending_approval||0)+'</div><div class="stat-label">Pending</div></div>';
 }
 
 function renderHealth(h) {
@@ -608,20 +680,30 @@ function renderMemory(m) {
     '<div style="margin-top:6px;font-size:0.8em;color:var(--text-dim)">Trajectories: '+(m.trajectories?.count||0)+'</div>';
 }
 
+// Track show-more state
+let queueShowAll = false;
 function renderQueue(q) {
   if (!q.tasks.length) { document.getElementById('queuePanel').innerHTML = '<span style="color:var(--text-dim)">No tasks</span>'; return; }
+  const limit = queueShowAll ? q.tasks.length : 10;
   let html = '<table><tr><th>#</th><th>Task</th><th>Status</th><th>P</th><th>Age</th></tr>';
-  for (const t of q.tasks.slice(0, 15)) {
-    html += '<tr><td>'+t.id+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+t.title+'</td><td>'+statusBadge(t.status)+'</td><td>'+( t.priority||'-')+'</td><td>'+ago(t.created_at)+'</td></tr>';
+  for (const t of q.tasks.slice(0, limit)) {
+    html += '<tr><td>'+t.id+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+t.title+'</td><td>'+statusBadge(t.status)+'</td><td>'+(t.priority||'-')+'</td><td>'+ago(t.created_at)+'</td></tr>';
   }
   html += '</table>';
+  if (q.tasks.length > 10) {
+    html += '<span class="show-more" onclick="queueShowAll=!queueShowAll;renderQueue(window._lastQueue)">'+(queueShowAll ? 'Show less' : 'Show all '+q.tasks.length+' tasks')+'</span>';
+  }
+  html += '<div style="font-size:0.75em;color:var(--text-dim);margin-top:4px">Total: '+q.total+' | Queued: '+(q.counts.queued||0)+' | Running: '+(q.counts.running||0)+' | Done: '+(q.counts.completed||0)+' | Failed: '+(q.counts.failed||0)+'</div>';
   document.getElementById('queuePanel').innerHTML = html;
+  window._lastQueue = q;
 }
 
+let goalsShowAll = false;
 function renderGoals(g) {
   if (!g.goals.length) { document.getElementById('goalsPanel').innerHTML = '<span style="color:var(--text-dim)">No goals</span>'; return; }
+  const limit = goalsShowAll ? g.goals.length : 10;
   let html = '<table><tr><th>#</th><th>Goal</th><th>Status</th><th>P</th><th>Actions</th></tr>';
-  for (const gl of g.goals.slice(0, 15)) {
+  for (const gl of g.goals.slice(0, limit)) {
     let actions = '';
     if (gl.status === 'pending_approval' || gl.status === 'proposed') {
       actions = '<button class="btn-sm btn-green" onclick="approveGoal('+gl.id+')">Approve</button> ' +
@@ -636,7 +718,11 @@ function renderGoals(g) {
     html += '<tr><td>'+gl.id+'</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(gl.reasoning||'')+'">'+gl.title+'</td><td>'+statusBadge(gl.status)+'</td><td>'+gl.priority+'</td><td>'+actions+'</td></tr>';
   }
   html += '</table>';
+  if (g.goals.length > 10) {
+    html += '<span class="show-more" onclick="goalsShowAll=!goalsShowAll;renderGoals(window._lastGoals)">'+(goalsShowAll ? 'Show less' : 'Show all '+g.goals.length+' goals')+'</span>';
+  }
   document.getElementById('goalsPanel').innerHTML = html;
+  window._lastGoals = g;
 }
 
 function renderTraining(t) {
@@ -645,16 +731,13 @@ function renderTraining(t) {
   const dpo = t.datasets['dpo_dataset.jsonl'];
   html += '<div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">'+(sft?.entries||0)+'</div><div class="stat-label">SFT</div></div>';
   html += '<div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">'+(dpo?.entries||0)+'</div><div class="stat-label">DPO</div></div>';
-  html += '<div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">'+( t.datasets['Modelfile'] ? '<span class="green">Yes</span>' : '<span class="red">No</span>')+'</div><div class="stat-label">Modelfile</div></div>';
+  html += '<div class="stat" style="min-width:80px"><div class="stat-value" style="font-size:1.3em">'+(t.datasets['Modelfile'] ? '<span class="green">Yes</span>' : '<span class="red">No</span>')+'</div><div class="stat-label">Modelfile</div></div>';
   html += '</div>';
   html += '<div style="font-size:0.8em;color:var(--text-dim);margin-bottom:4px">Model: <strong>'+t.model+'</strong></div>';
-  if (t.last_train) {
-    html += '<div style="font-size:0.8em;color:var(--text-dim)">Last train: '+ago(t.last_train.timestamp)+' &bull; '+( t.last_train.examples||'?')+' examples</div>';
-  }
+  if (t.last_train) html += '<div style="font-size:0.8em;color:var(--text-dim)">Last train: '+ago(t.last_train.timestamp)+' &bull; '+(t.last_train.examples||'?')+' examples</div>';
   if (t.eval) {
     const wins = t.eval.tuned_wins || 0, total = t.eval.total || 5;
-    const color = wins >= 3 ? 'green' : 'yellow';
-    html += '<div style="font-size:0.8em;margin-top:4px">Eval: <span class="'+color+'">'+wins+'/'+total+'</span> tuned wins</div>';
+    html += '<div style="font-size:0.8em;margin-top:4px">Eval: <span class="'+(wins>=3?'green':'yellow')+'">'+wins+'/'+total+'</span> tuned wins</div>';
   }
   document.getElementById('trainingPanel').innerHTML = html;
 }
@@ -676,7 +759,7 @@ function renderTrajectories(t) {
 
 function renderSkills(s) {
   if (!s.skills.length) { document.getElementById('skillsPanel').innerHTML = '<span style="color:var(--text-dim)">No learned skills yet</span>'; return; }
-  let html = '';
+  let html = '<div style="margin-bottom:8px;font-size:0.85em;color:var(--text-dim)">'+s.count+' skills learned</div>';
   for (const sk of s.skills) {
     html += '<div class="skill-item"><div class="skill-name">'+sk.name+'</div><div class="skill-desc">'+sk.description+'</div></div>';
   }
@@ -718,6 +801,33 @@ function renderLogs(logs) {
   document.getElementById('logPanel').innerHTML = html;
 }
 
+function renderSuppressed(data) {
+  const el = document.getElementById('suppressedPanel');
+  if (!data.suppressed.length) { el.innerHTML = '<span style="color:var(--text-dim)">No suppressed alerts (good!)</span>'; return; }
+  let html = '<div style="margin-bottom:6px;font-size:0.8em;color:var(--text-dim)">'+data.count+' hallucinated alerts caught</div>';
+  for (const s of data.suppressed) {
+    html += '<div class="suppressed-row">' +
+      '<span class="suppressed-claim">'+s.claimed+'</span> ' +
+      '<span class="suppressed-actual">'+s.actual+'</span>' +
+      '<div style="color:var(--text-dim);font-size:0.75em">'+ago(s.timestamp)+' &bull; Task #'+s.id+'</div></div>';
+  }
+  el.innerHTML = html;
+}
+
+async function loadLogs() {
+  const [logs, suppressed] = await Promise.all([
+    fetch('/api/logs').then(r=>r.json()),
+    fetch('/api/suppressed').then(r=>r.json()),
+  ]);
+  renderLogs(logs);
+  renderSuppressed(suppressed);
+}
+
+async function loadSkills() {
+  const s = await fetch('/api/skills').then(r=>r.json());
+  renderSkills(s);
+}
+
 async function approveGoal(id) {
   try {
     await fetch('/api/goals/approve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({goal_id:id})});
@@ -744,9 +854,8 @@ async function triggerCycle() {
 
 async function refresh() {
   try {
-    const [overview, logs, sparkData, training] = await Promise.all([
+    const [overview, sparkData, training] = await Promise.all([
       fetch('/api/overview').then(r=>r.json()),
-      fetch('/api/logs').then(r=>r.json()),
       fetch('/api/health-history?limit=50').then(r=>r.json()),
       fetch('/api/training').then(r=>r.json()),
     ]);
@@ -758,9 +867,6 @@ async function refresh() {
     renderGoals(overview.goals);
     renderTraining(training);
     renderTrajectories(overview.trajectories);
-    renderSkills(overview.skills);
-    renderLogs(logs);
-    loadGoalHistory(goalHistoryPage);
     document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
   } catch(e) {
     document.getElementById('lastUpdate').textContent = 'Error: ' + e.message;
@@ -769,7 +875,6 @@ async function refresh() {
 
 connectSSE();
 refresh();
-// Fallback polling if SSE disconnects
 setInterval(() => { if (!evtSource || evtSource.readyState === 2) refresh(); }, 15000);
 </script>
 </body>

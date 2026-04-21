@@ -337,6 +337,21 @@ def run_scheduler(preset: str = "default", watchdog_only: bool = False, generate
             except Exception:
                 pass  # Cortex approval check is best-effort
 
+            # Drain mode: if queue backlog > 100, run extra executor passes between heartbeats
+            try:
+                queue_depth = orchestrator.get_queue_depth()
+                if queue_depth > 100:
+                    import executor as drain_exec
+                    drain_db = drain_exec.get_db()
+                    drained = drain_exec.run_queue(drain_db, limit=20)
+                    drain_db.close()
+                    if drained:
+                        log_structured("INFO", "drain",
+                                       f"Drain pass: {len(drained)} tasks (backlog was {queue_depth})",
+                                       drained=len(drained), backlog=queue_depth)
+            except Exception:
+                pass  # Drain is best-effort
+
             last_watchdog = now
 
         # Full heartbeat cycle (less frequent)

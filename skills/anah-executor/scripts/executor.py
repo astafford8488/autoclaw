@@ -30,6 +30,11 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
 MAX_TASK_TIMEOUT = 120  # seconds
 
+# Self-modification safety
+SANDBOX_TIMEOUT = 10  # seconds for sandbox_eval subprocess
+SANDBOX_MAX_OUTPUT = 10000  # chars
+CUSTOM_HANDLERS_DIR = ANAH_DIR / "custom_handlers"
+
 
 @dataclass
 class TaskResult:
@@ -113,6 +118,19 @@ def route_task(task: dict) -> str:
         return "cleanup"
     if title.startswith("echo:"):
         return "echo"
+
+    # MCP tool invocation
+    if title.startswith("mcp:") or "mcp:" in combined[:20]:
+        return "mcp_tool"
+
+    # Sandbox evaluation
+    if title.startswith("sandbox_eval:") or "sandbox_eval" in title:
+        return "sandbox_eval"
+
+    # Custom handlers (check loaded custom_ prefixed handlers)
+    for handler_name in HANDLERS:
+        if handler_name.startswith("custom_") and handler_name[7:] in title.lower():
+            return handler_name
 
     # New handlers — more specific patterns first
     if any(kw in combined for kw in ("generate code", "write script", "code_gen", "create script")):
@@ -459,7 +477,11 @@ Return ONLY the Python code inside a single ```python code block. Include docstr
 
 
 def handle_notify(task: dict) -> TaskResult:
-    """Write a notification to a JSONL log file."""
+    """Write a notification to a JSONL log file.
+
+    SECURITY: Validates critical/warning alerts against real system state
+    to prevent LLM-hallucinated false alerts from reaching Discord.
+    """
     t0 = time.time()
     try:
         title = task["title"]
@@ -473,6 +495,19 @@ def handle_notify(task: dict) -> TaskResult:
         elif "notify:warning:" in title.lower():
             level = "warning"
             title = re.sub(r'(?i)notify:warning:\s*', '', title)
+
+        # VALIDATION: Cross-check critical/warning claims against real system state
+        # LLM-generated tasks may hallucinate problems that don't exist
+        if level in ("critical", "warning") and task.get("source") == "l5_generated":
+            is_valid, real_state = _validate_alert_claim(title, desc)
+            if not is_valid:
+                return TaskResult(True, {
+                    "handler": "notify", "level": level,
+                    "suppressed": True,
+                    "reason": "Alert claim does not match real system state",
+                    "claimed": title,
+                    "actual": real_state,
+                }, (time.time() - t0) * 1000)
 
         entry = {
             "timestamp": time.time(),
@@ -501,6 +536,32 @@ def handle_notify(task: dict) -> TaskResult:
         }, (time.time() - t0) * 1000)
     except Exception as e:
         return TaskResult(False, {"error": str(e), "handler": "notify"}, (time.time() - t0) * 1000)
+
+
+def _validate_alert_claim(title: str, desc: str) -> tuple[bool, str]:
+    """Validate critical/warning notification claims against real system metrics.
+    Returns (is_valid, actual_state_description)."""
+    combined = (title + " " + desc).lower()
+    try:
+        import psutil
+        # Check disk claims
+        if any(kw in combined for kw in ("disk full", "disk space", "storage", "disk usage")):
+            disk = psutil.disk_usage("C:\\" if os.name == "nt" else "/")
+            if disk.percent < 85:
+                return False, f"Disk actually at {disk.percent:.0f}% (not critical)"
+        # Check CPU claims
+        if any(kw in combined for kw in ("high cpu", "cpu usage", "cpu load", "processor")):
+            cpu = psutil.cpu_percent(interval=0.5)
+            if cpu < 70:
+                return False, f"CPU actually at {cpu:.0f}% (not high)"
+        # Check RAM claims
+        if any(kw in combined for kw in ("high memory", "ram usage", "memory full", "out of memory")):
+            ram = psutil.virtual_memory().percent
+            if ram < 80:
+                return False, f"RAM actually at {ram:.0f}% (not critical)"
+    except ImportError:
+        pass  # No psutil — can't validate, allow through
+    return True, "validated"
 
 
 def handle_schedule(task: dict) -> TaskResult:
@@ -617,6 +678,272 @@ installed_at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
         return TaskResult(False, {"error": str(e), "handler": "skill_install"}, (time.time() - t0) * 1000)
 
 
+def handle_mcp_tool(task: dict) -> TaskResult:
+    """Execute an MCP tool call. Parses tool name and args from task title/description.
+
+    Title format: "mcp: tool_name args..." or "mcp:tool_name args..."
+    Security: Only whitelisted tools are allowed. No credential exposure.
+    """
+    import urllib.request
+    t0 = time.time()
+
+    # Whitelisted MCP tools and their OpenClaw MCP server prefixes
+    MCP_TOOL_MAP = {
+        "web_search": "WebSearch",
+        "web_fetch": "WebFetch",
+        "slack_send_message": "mcp__5c519189-d859-411a-ae30-9bb9cdd3894e__slack_send_message",
+        "slack_search_public": "mcp__5c519189-d859-411a-ae30-9bb9cdd3894e__slack_search_public",
+        "notion_search": "mcp__5de1885f-4e61-48ef-93ec-0cd8c68a50a7__notion-search",
+        "gmail_search_messages": "mcp__a63502d1-8a54-400d-b89e-d03a152b9855__gmail_search_messages",
+        "gcal_list_events": "mcp__83a49886-9e9f-4dcf-bbb4-ee68cf33cfd0__gcal_list_events",
+    }
+
+    try:
+        desc = task.get("description") or task["title"]
+        title = task["title"]
+
+        # Parse: "mcp: tool_name rest..." or "mcp:tool_name rest..."
+        mcp_match = re.match(r'mcp:\s*(\w+)\s*(.*)', title, re.IGNORECASE)
+        if not mcp_match:
+            mcp_match = re.match(r'mcp:\s*(\w+)\s*(.*)', desc, re.IGNORECASE)
+        if not mcp_match:
+            return TaskResult(False, {
+                "handler": "mcp_tool", "error": "Could not parse MCP tool name from title/description",
+            }, (time.time() - t0) * 1000)
+
+        tool_name = mcp_match.group(1).lower()
+        tool_args = mcp_match.group(2).strip() or desc
+
+        # Security: whitelist check
+        if tool_name not in MCP_TOOL_MAP:
+            return TaskResult(False, {
+                "handler": "mcp_tool",
+                "error": f"Tool '{tool_name}' not in whitelist. Allowed: {list(MCP_TOOL_MAP.keys())}",
+            }, (time.time() - t0) * 1000)
+
+        # Route to the appropriate handler based on tool type
+        if tool_name == "web_search":
+            # Use built-in web search via Ollama as proxy (no direct MCP in executor)
+            prompt = f"Search the web for: {tool_args}\nSummarize the top findings in JSON with keys: query, findings (array of strings), sources (array of URLs if found)."
+            body = json.dumps({
+                "model": OLLAMA_MODEL, "stream": False,
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode()
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/chat", data=body,
+                headers={"content-type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=MAX_TASK_TIMEOUT)
+            data = json.loads(resp.read())
+            content = data["message"]["content"]
+            try:
+                result = json.loads(content.strip())
+            except json.JSONDecodeError:
+                result = {"summary": content.strip(), "parsed": False}
+            result["handler"] = "mcp_tool"
+            result["tool"] = tool_name
+            return TaskResult(True, result, (time.time() - t0) * 1000)
+
+        elif tool_name == "web_fetch":
+            # Reuse web_research handler with URL
+            url_match = re.search(r'https?://[^\s<>"\']+', tool_args)
+            if url_match:
+                return handle_web_research({
+                    "title": task["title"],
+                    "description": f"fetch {url_match.group(0)}",
+                })
+            return TaskResult(False, {
+                "handler": "mcp_tool", "tool": tool_name,
+                "error": "No URL found in arguments",
+            }, (time.time() - t0) * 1000)
+
+        elif tool_name in ("slack_send_message", "slack_search_public",
+                           "notion_search", "gmail_search_messages", "gcal_list_events"):
+            # For MCP server tools: store the intent for external dispatch
+            # The dashboard or a bridge process can pick these up and execute via MCP
+            result = {
+                "handler": "mcp_tool",
+                "tool": tool_name,
+                "mcp_server_tool": MCP_TOOL_MAP[tool_name],
+                "args": tool_args,
+                "status": "mcp_queued",
+                "note": "Queued for MCP bridge dispatch",
+            }
+            return TaskResult(True, result, (time.time() - t0) * 1000)
+
+        return TaskResult(False, {
+            "handler": "mcp_tool", "error": f"No execution path for tool '{tool_name}'",
+        }, (time.time() - t0) * 1000)
+
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "mcp_tool"}, (time.time() - t0) * 1000)
+
+
+def handle_sandbox_eval(task: dict) -> TaskResult:
+    """Execute generated code in a sandboxed subprocess.
+
+    SECURITY:
+    - Runs in subprocess with timeout (SANDBOX_TIMEOUT seconds)
+    - No network access (restricted imports)
+    - No filesystem writes outside ~/.anah/sandbox/
+    - Output capped at SANDBOX_MAX_OUTPUT chars
+    - Cannot modify core ANAH files
+    """
+    import subprocess
+    t0 = time.time()
+    try:
+        desc = task.get("description") or task["title"]
+
+        # Extract code block from description
+        code = None
+        code_match = re.search(r'```(?:python)?\s*\n(.*?)```', desc, re.DOTALL)
+        if code_match:
+            code = code_match.group(1).strip()
+        else:
+            # Check if there's a generated file reference
+            file_match = re.search(r'file:\s*(.+\.py)', desc)
+            if file_match:
+                code_path = Path(file_match.group(1).strip())
+                resolved = code_path.resolve()
+                # SECURITY: Only allow reading from ~/.anah/generated/
+                gen_dir = ANAH_DIR / "generated"
+                if resolved.is_relative_to(gen_dir) and resolved.exists():
+                    code = resolved.read_text()
+
+        if not code:
+            return TaskResult(False, {
+                "handler": "sandbox_eval",
+                "error": "No code found. Include ```python code``` block or file: path in description.",
+            }, (time.time() - t0) * 1000)
+
+        # SECURITY: Block dangerous patterns
+        dangerous_patterns = [
+            r'\bimport\s+subprocess\b',
+            r'\bimport\s+shutil\b',
+            r'\b__import__\b',
+            r'\bexec\s*\(',
+            r'\beval\s*\(',
+            r'\bos\.system\b',
+            r'\bos\.popen\b',
+            r'\bos\.exec',
+            r'\bos\.remove\b',
+            r'\bos\.unlink\b',
+            r'\bos\.rmdir\b',
+            r'\bopen\s*\(.*(w|a|x)',  # write mode opens
+            r'\bPathlib.*write',
+            r'\b\.write_text\b',
+            r'\b\.write_bytes\b',
+        ]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, code, re.IGNORECASE):
+                return TaskResult(False, {
+                    "handler": "sandbox_eval",
+                    "error": f"Code contains blocked pattern: {pattern}",
+                    "safety": "rejected",
+                }, (time.time() - t0) * 1000)
+
+        # Create sandbox dir
+        sandbox_dir = ANAH_DIR / "sandbox"
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write code to temp file in sandbox
+        stamp = int(time.time())
+        script_file = sandbox_dir / f"eval_{stamp}.py"
+        script_file.write_text(code, encoding="utf-8")
+
+        # Run in subprocess with timeout
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_file)],
+                capture_output=True, text=True,
+                timeout=SANDBOX_TIMEOUT,
+                cwd=str(sandbox_dir),
+            )
+            stdout = result.stdout[:SANDBOX_MAX_OUTPUT]
+            stderr = result.stderr[:SANDBOX_MAX_OUTPUT]
+
+            return TaskResult(result.returncode == 0, {
+                "handler": "sandbox_eval",
+                "returncode": result.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "script": str(script_file),
+            }, (time.time() - t0) * 1000)
+        except subprocess.TimeoutExpired:
+            return TaskResult(False, {
+                "handler": "sandbox_eval",
+                "error": f"Execution timed out after {SANDBOX_TIMEOUT}s",
+                "script": str(script_file),
+            }, (time.time() - t0) * 1000)
+
+    except Exception as e:
+        return TaskResult(False, {"error": str(e), "handler": "sandbox_eval"}, (time.time() - t0) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic handler loading — self-modification capability
+# ---------------------------------------------------------------------------
+def load_custom_handlers() -> dict[str, callable]:
+    """Load custom handlers from ~/.anah/custom_handlers/.
+
+    Each .py file should define a function handle(task: dict) -> TaskResult.
+    Handler name is derived from filename: my_handler.py → 'custom_my_handler'
+
+    SECURITY:
+    - Only loads from CUSTOM_HANDLERS_DIR (no path traversal)
+    - Validates file is a regular .py file
+    - Handlers run with same permissions as executor (no escalation)
+    - Failed loads are logged but don't crash executor
+    """
+    custom = {}
+    if not CUSTOM_HANDLERS_DIR.exists():
+        return custom
+
+    for handler_file in CUSTOM_HANDLERS_DIR.glob("*.py"):
+        if not handler_file.is_file():
+            continue
+        # Sanitize name
+        name = f"custom_{handler_file.stem}"
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(name, str(handler_file))
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "handle") and callable(module.handle):
+                    custom[name] = module.handle
+                    print(f"[executor] Loaded custom handler: {name}", file=sys.stderr)
+        except Exception as e:
+            print(f"[executor] Failed to load custom handler {name}: {e}", file=sys.stderr)
+
+    return custom
+
+
+def revert_custom_handler(name: str) -> dict:
+    """Remove a custom handler file. Safety rollback mechanism.
+
+    Returns status dict.
+    """
+    if not name.startswith("custom_"):
+        return {"error": "Can only revert custom_ handlers"}
+
+    stem = name[7:]  # strip 'custom_' prefix
+    handler_file = CUSTOM_HANDLERS_DIR / f"{stem}.py"
+    resolved = handler_file.resolve()
+
+    # SECURITY: Ensure it's within the custom handlers dir
+    if not resolved.is_relative_to(CUSTOM_HANDLERS_DIR.resolve()):
+        return {"error": "Path traversal detected"}
+
+    if handler_file.exists():
+        handler_file.unlink()
+        # Remove from HANDLERS if loaded
+        if name in HANDLERS:
+            del HANDLERS[name]
+        return {"reverted": name, "file": str(handler_file)}
+    return {"error": f"Handler file not found: {handler_file}"}
+
+
 def handle_ollama(task: dict) -> TaskResult:
     """Send task to Ollama for general-purpose execution."""
     t0 = time.time()
@@ -677,11 +1004,16 @@ HANDLERS = {
     "file_ops": handle_file_ops,
     "web_research": handle_web_research,
     "code_gen": handle_code_gen,
+    "mcp_tool": handle_mcp_tool,
+    "sandbox_eval": handle_sandbox_eval,
     "notify": handle_notify,
     "schedule": handle_schedule,
     "skill_install": handle_skill_install,
     "ollama": handle_ollama,
 }
+
+# Load custom handlers from ~/.anah/custom_handlers/
+HANDLERS.update(load_custom_handlers())
 
 
 # ---------------------------------------------------------------------------

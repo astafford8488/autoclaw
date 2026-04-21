@@ -483,6 +483,162 @@ class TestRunGeneration:
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Goal chaining
+# ---------------------------------------------------------------------------
+class TestGoalChaining:
+    def test_parse_chain_response(self):
+        data = {"chain": True, "steps": [
+            {"step": 1, "title": "research X", "priority": 5, "description": "d1", "reasoning": "r1"},
+            {"step": 2, "title": "implement X", "priority": 5, "description": "d2", "reasoning": "r2", "depends_on": 1},
+        ]}
+        goals = cortex._parse_chain_response(data)
+        assert len(goals) == 2
+        assert goals[0].chain_id is not None
+        assert goals[0].chain_step == 1
+        assert goals[1].chain_step == 2
+        assert goals[1].depends_on_goal_id == 1  # step number, not goal_id yet
+        assert goals[0].chain_id == goals[1].chain_id
+
+    def test_parse_chain_response_non_chain(self):
+        data = [{"title": "solo task", "priority": 3}]
+        goals = cortex._parse_chain_response(data)
+        assert len(goals) == 1
+        assert goals[0].chain_id is None
+
+    def test_parse_chain_single_dict(self):
+        data = {"title": "one goal", "priority": 4}
+        goals = cortex._parse_chain_response(data)
+        assert len(goals) == 1
+        assert goals[0].title == "one goal"
+
+    def test_chain_logged_with_ids(self, anah_dir, anah_db):
+        """Chain goals logged to DB with resolved depends_on_goal_id."""
+        context = {"health_score": 80, "queue": {"queued": 0, "running": 0}}
+        chain_json = json.dumps({"chain": True, "steps": [
+            {"step": 1, "title": "step one", "priority": 5, "description": "d", "reasoning": "r"},
+            {"step": 2, "title": "step two", "priority": 5, "description": "d", "reasoning": "r", "depends_on": 1},
+        ]})
+        with patch.object(cortex, "DB_FILE", anah_dir / "anah.db"), \
+             patch.object(cortex, "ANAH_DIR", anah_dir), \
+             patch.object(cortex, "GOAL_APPROVAL", False), \
+             patch.object(cortex, "_call_ollama", side_effect=[
+                 '{"needs":["test"],"avoid":[],"leverage":[]}', chain_json]), \
+             patch.object(cortex, "_call_haiku", return_value=None):
+            results = cortex.run_generation(context, [])
+        assert len(results) == 2
+        # Step 1 should be enacted (no dependency)
+        assert results[0]["status"] == "enacted"
+        assert results[0]["chain_step"] == 1
+        # Step 2 should be waiting (depends on step 1)
+        assert results[1]["status"] == "waiting"
+        assert results[1]["depends_on_goal_id"] == results[0]["goal_id"]
+
+    def test_chain_promotion(self, anah_dir, anah_db):
+        """Waiting chain step promotes when dependency task completes."""
+        now = time.time()
+        # Create step 1 goal (enacted, task completed)
+        anah_db.execute(
+            "INSERT INTO task_queue (id, created_at, priority, title, status) VALUES (100, ?, 5, 'step1', 'completed')",
+            (now,))
+        anah_db.execute(
+            "INSERT INTO generated_goals (id, timestamp, title, priority, source, status, task_id, chain_id, chain_step) "
+            "VALUES (200, ?, 'step1', 5, 'llm', 'enacted', 100, 'abc123', 1)", (now,))
+        # Create step 2 goal (waiting on step 1)
+        anah_db.execute(
+            "INSERT INTO generated_goals (id, timestamp, title, priority, source, status, chain_id, chain_step, depends_on_goal_id) "
+            "VALUES (201, ?, 'step2', 5, 'llm', 'waiting', 'abc123', 2, 200)", (now,))
+        anah_db.commit()
+
+        result = cortex.check_chain_promotions(anah_db)
+        assert result["promoted"] == 1
+        # Step 2 should now be enacted with a task
+        row = dict(anah_db.execute("SELECT status, task_id FROM generated_goals WHERE id = 201").fetchone())
+        assert row["status"] == "enacted"
+        assert row["task_id"] is not None
+
+    def test_chain_dismisses_on_failed_dep(self, anah_dir, anah_db):
+        """Waiting chain step is dismissed when dependency task fails."""
+        now = time.time()
+        anah_db.execute(
+            "INSERT INTO task_queue (id, created_at, priority, title, status) VALUES (100, ?, 5, 'step1', 'failed')",
+            (now,))
+        anah_db.execute(
+            "INSERT INTO generated_goals (id, timestamp, title, priority, source, status, task_id, chain_id, chain_step) "
+            "VALUES (200, ?, 'step1', 5, 'llm', 'enacted', 100, 'abc123', 1)", (now,))
+        anah_db.execute(
+            "INSERT INTO generated_goals (id, timestamp, title, priority, source, status, chain_id, chain_step, depends_on_goal_id) "
+            "VALUES (201, ?, 'step2', 5, 'llm', 'waiting', 'abc123', 2, 200)", (now,))
+        anah_db.commit()
+
+        cortex.check_chain_promotions(anah_db)
+        row = dict(anah_db.execute("SELECT status FROM generated_goals WHERE id = 201").fetchone())
+        assert row["status"] == "dismissed"
+
+
+# ---------------------------------------------------------------------------
+# MCP tools formatting
+# ---------------------------------------------------------------------------
+class TestMCPTools:
+    def test_format_mcp_tools(self):
+        text = cortex.format_mcp_tools()
+        assert "web_search" in text
+        assert "web_fetch" in text
+        assert "slack_send_message" in text
+
+    def test_mcp_tools_in_generation_prompt(self):
+        """GENERATION_PROMPT has {mcp_tools} placeholder."""
+        assert "{mcp_tools}" in cortex.GENERATION_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+class TestMetacognitionIntegration:
+    """Tests that cortex properly integrates metacognition strategy."""
+
+    def test_analysis_prompt_has_strategy_placeholder(self):
+        assert "{strategy}" in cortex.ANALYSIS_PROMPT
+
+    def test_twophase_formats_strategy(self, anah_dir, anah_db):
+        """generate_goals_twophase injects strategy text into ANALYSIS_PROMPT."""
+        captured_messages = []
+
+        def mock_ollama(messages, timeout=60):
+            captured_messages.append(messages)
+            return '{"needs": ["test"], "avoid": [], "leverage": []}'
+
+        with patch.object(cortex, "_call_ollama", side_effect=mock_ollama), \
+             patch.object(cortex, "DB_FILE", anah_dir / "anah.db"):
+            # Mock strategy
+            import metacognition
+            with patch.object(metacognition, "load_strategy", return_value=[
+                {"category": "avoid", "title": "Stop cleanup tasks", "confidence": 0.9, "timestamp": 1}
+            ]):
+                cortex.generate_goals_twophase({}, "None", {}, [])
+
+        # First call should be analysis phase with strategy injected
+        assert len(captured_messages) >= 1
+        analysis_system = captured_messages[0][0]["content"]
+        assert "Stop cleanup tasks" in analysis_system or "No strategic insights" in analysis_system
+
+    def test_twophase_graceful_without_metacognition(self, anah_dir):
+        """Doesn't crash if metacognition import fails."""
+        captured = []
+
+        def mock_ollama(messages, timeout=60):
+            captured.append(messages)
+            return '{"needs": ["test"], "avoid": [], "leverage": []}'
+
+        with patch.object(cortex, "_call_ollama", side_effect=mock_ollama), \
+             patch.dict("sys.modules", {"metacognition": None}):
+            cortex.generate_goals_twophase({}, "None", {}, [])
+
+        assert len(captured) >= 1
+        analysis_system = captured[0][0]["content"]
+        assert "No strategic insights" in analysis_system
+
+
 class TestSecurity:
     def test_sql_injection_in_title(self, anah_dir, anah_db):
         with patch.object(cortex, "DB_FILE", anah_dir / "anah.db"):

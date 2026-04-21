@@ -21,11 +21,12 @@ CORTEX_DIR = SKILLS_DIR / "anah-cortex" / "scripts"
 EXECUTOR_DIR = SKILLS_DIR / "anah-executor" / "scripts"
 HIPPOCAMPUS_DIR = SKILLS_DIR / "anah-hippocampus" / "scripts"
 MEMORY_DIR = SKILLS_DIR / "anah-memory" / "scripts"
+METACOGNITION_DIR = SKILLS_DIR / "anah-cortex" / "scripts"
 
 ANAH_DIR = Path.home() / ".anah"
 
 # Add script dirs to path for imports
-for d in (BRAINSTEM_DIR, CEREBELLUM_DIR, CORTEX_DIR, EXECUTOR_DIR, HIPPOCAMPUS_DIR, MEMORY_DIR):
+for d in (BRAINSTEM_DIR, CEREBELLUM_DIR, CORTEX_DIR, EXECUTOR_DIR, HIPPOCAMPUS_DIR, MEMORY_DIR, METACOGNITION_DIR):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
@@ -150,8 +151,8 @@ def run_cortex(cerebellum_output: dict, generate: bool = True) -> dict:
     return {"enacted": enacted, "count": len(enacted)}
 
 
-def run_executor(limit: int = 5) -> dict:
-    """Execute queued tasks."""
+def run_executor(limit: int = 20) -> dict:
+    """Execute queued tasks. Default raised to 20 (most tasks are fast)."""
     import executor
     db = executor.get_db()
     results = executor.run_queue(db, limit=limit)
@@ -159,6 +160,15 @@ def run_executor(limit: int = 5) -> dict:
     succeeded = sum(1 for r in results if r.get("success"))
     failed = sum(1 for r in results if not r.get("success"))
     return {"processed": len(results), "succeeded": succeeded, "failed": failed, "results": results}
+
+
+def get_queue_depth() -> int:
+    """Get current number of queued tasks."""
+    import executor
+    db = executor.get_db()
+    row = db.execute("SELECT COUNT(*) FROM task_queue WHERE status = 'queued'").fetchone()
+    db.close()
+    return row[0] if row else 0
 
 
 def run_hippocampus(hours: float = 1.0) -> dict:
@@ -173,6 +183,15 @@ def run_memory_status() -> dict:
     """Get memory utilization."""
     import memory
     return memory.memory_status()
+
+
+def run_metacognition_cycle() -> dict:
+    """Run metacognition self-analysis after hippocampus."""
+    try:
+        import metacognition
+        return metacognition.run_metacognition()
+    except Exception as e:
+        return {"error": str(e), "trends": 0, "new_strategies": 0}
 
 
 def run_trajectory_export() -> dict:
@@ -224,15 +243,34 @@ def full_cycle(generate: bool = True, execute: bool = True, learn: bool = True) 
     }
 
     # 3. Executor — process queued tasks before generating new ones
+    #    Drain harder when backlog exists
+    queue_depth = get_queue_depth()
     if execute:
-        print("[executor] Processing queued tasks...", file=sys.stderr)
-        exec_out = run_executor(limit=5)
+        exec_limit = 50 if queue_depth > 100 else 20
+        print(f"[executor] Processing queued tasks (limit={exec_limit}, backlog={queue_depth})...", file=sys.stderr)
+        exec_out = run_executor(limit=exec_limit)
         result["executor"] = exec_out
 
-    # 4. Cortex — goal generation
-    print("[cortex] Generating goals...", file=sys.stderr)
-    cortex_out = run_cortex(cerebellum_out, generate=generate)
+    # 4. Cortex — goal generation (skip if queue backlog > 50)
+    if queue_depth > 50:
+        print(f"[cortex] Skipping generation — queue backlog ({queue_depth}) > 50", file=sys.stderr)
+        cortex_out = {"skipped": True, "reason": f"queue backlog {queue_depth}", "count": 0}
+    else:
+        print("[cortex] Generating goals...", file=sys.stderr)
+        cortex_out = run_cortex(cerebellum_out, generate=generate)
     result["cortex"] = cortex_out
+
+    # 4b. Chain promotions — advance waiting chain steps whose deps completed
+    try:
+        import cortex
+        chain_db = cortex.get_db()
+        chain_result = cortex.check_chain_promotions(chain_db)
+        chain_db.close()
+        if chain_result.get("promoted", 0) > 0:
+            print(f"[chains] Promoted {chain_result['promoted']} waiting chain steps", file=sys.stderr)
+            result["chains"] = chain_result
+    except Exception:
+        pass
 
     # 5. Hippocampus — skill learning
     if learn:
@@ -240,7 +278,16 @@ def full_cycle(generate: bool = True, execute: bool = True, learn: bool = True) 
         hippo_out = run_hippocampus()
         result["hippocampus"] = hippo_out
 
-    # 6. Trajectory export — save completed task traces for training
+    # 6. Metacognition — self-awareness and strategy
+    print("[metacognition] Analyzing performance...", file=sys.stderr)
+    meta_out = run_metacognition_cycle()
+    result["metacognition"] = {
+        "trends": meta_out.get("trends", 0),
+        "new_strategies": meta_out.get("new_strategies", 0),
+        "capability_gaps": meta_out.get("capability_gaps", 0),
+    }
+
+    # 7. Trajectory export — save completed task traces for training
     print("[memory] Exporting trajectories...", file=sys.stderr)
     traj_out = run_trajectory_export()
     result["trajectories"] = traj_out

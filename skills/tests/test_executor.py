@@ -670,3 +670,334 @@ class TestSkillInstallHandler:
         # Should be installed safely within ANAH_DIR/skills/
         skill_path = Path(result.result["path"])
         assert str(anah_dir) in str(skill_path)
+
+
+# =========================================================================
+# Alert validation tests (LLM hallucination suppression)
+# =========================================================================
+class TestAlertValidation:
+    """Validate that LLM-hallucinated critical/warning alerts are suppressed."""
+
+    def test_suppresses_fake_disk_full(self, anah_dir):
+        """LLM claims disk full but real disk is fine → suppressed."""
+        mock_disk = MagicMock()
+        mock_disk.percent = 42.0  # Actually fine
+        with patch.object(executor, "ANAH_DIR", anah_dir), \
+             patch("psutil.disk_usage", return_value=mock_disk):
+            result = executor.handle_notify({
+                "title": "notify:critical: disk full",
+                "description": "95% used",
+                "source": "l5_generated",
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is True
+        assert "42%" in result.result["actual"]
+
+    def test_suppresses_fake_high_cpu(self, anah_dir):
+        """LLM claims high CPU but real CPU is idle → suppressed."""
+        with patch.object(executor, "ANAH_DIR", anah_dir), \
+             patch("psutil.cpu_percent", return_value=15.0):
+            result = executor.handle_notify({
+                "title": "notify:warning: high cpu",
+                "description": "80%",
+                "source": "l5_generated",
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is True
+
+    def test_suppresses_fake_memory_full(self, anah_dir):
+        """LLM claims memory full but real RAM is fine → suppressed."""
+        mock_ram = MagicMock()
+        mock_ram.percent = 35.0
+        with patch.object(executor, "ANAH_DIR", anah_dir), \
+             patch("psutil.virtual_memory", return_value=mock_ram):
+            result = executor.handle_notify({
+                "title": "notify:critical: out of memory",
+                "description": "system running low",
+                "source": "l5_generated",
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is True
+
+    def test_allows_real_disk_alert(self, anah_dir):
+        """Real disk is actually full → alert goes through."""
+        mock_disk = MagicMock()
+        mock_disk.percent = 96.0  # Actually full
+        with patch.object(executor, "ANAH_DIR", anah_dir), \
+             patch("psutil.disk_usage", return_value=mock_disk):
+            result = executor.handle_notify({
+                "title": "notify:critical: disk full",
+                "description": "96% used",
+                "source": "l5_generated",
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is not True
+        assert result.result["level"] == "critical"
+
+    def test_allows_non_l5_notifications(self, anah_dir):
+        """Non-LLM-generated alerts are never suppressed."""
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_notify({
+                "title": "notify:critical: disk full",
+                "description": "95% used",
+                # No "source": "l5_generated"
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is not True
+
+    def test_allows_info_level_from_llm(self, anah_dir):
+        """Info-level notifications from LLM are never suppressed."""
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_notify({
+                "title": "notify: system ok",
+                "description": "all green",
+                "source": "l5_generated",
+            })
+        assert result.success is True
+        assert result.result.get("suppressed") is not True
+        assert result.result["level"] == "info"
+
+
+# =========================================================================
+# MCP tool handler tests
+# =========================================================================
+class TestMCPToolHandler:
+    """MCP tool invocation handler."""
+
+    def test_route_mcp(self):
+        assert executor.route_task({"title": "mcp: web_search best practices"}) == "mcp_tool"
+
+    def test_route_mcp_no_space(self):
+        assert executor.route_task({"title": "mcp:web_fetch https://example.com"}) == "mcp_tool"
+
+    def test_whitelist_blocks_unknown_tool(self):
+        result = executor.handle_mcp_tool({
+            "title": "mcp: evil_tool hack the planet",
+            "description": "mcp: evil_tool hack",
+        })
+        assert result.success is False
+        assert "not in whitelist" in result.result["error"]
+
+    def test_web_search_calls_ollama(self):
+        mock_data = {"message": {"content": '{"query":"test","findings":["result1"]}'}}
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_data).encode()
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = executor.handle_mcp_tool({
+                "title": "mcp: web_search SQLite optimization",
+                "description": "mcp: web_search SQLite optimization tips",
+            })
+        assert result.success is True
+        assert result.result["tool"] == "web_search"
+
+    def test_web_fetch_delegates_to_web_research(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"<html><body>Page content</body></html>"
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = executor.handle_mcp_tool({
+                "title": "mcp: web_fetch https://example.com/docs",
+                "description": "mcp: web_fetch https://example.com/docs",
+            })
+        assert result.success is True
+        assert "example.com" in result.result.get("url", "")
+
+    def test_slack_queues_for_mcp_bridge(self):
+        result = executor.handle_mcp_tool({
+            "title": "mcp: slack_send_message hello world",
+            "description": "mcp: slack_send_message #general hello world",
+        })
+        assert result.success is True
+        assert result.result["status"] == "mcp_queued"
+        assert result.result["tool"] == "slack_send_message"
+
+    def test_notion_queues_for_mcp_bridge(self):
+        result = executor.handle_mcp_tool({
+            "title": "mcp: notion_search project roadmap",
+            "description": "mcp: notion_search project roadmap",
+        })
+        assert result.success is True
+        assert result.result["status"] == "mcp_queued"
+
+    def test_unparseable_title(self):
+        result = executor.handle_mcp_tool({
+            "title": "do something random",
+            "description": "no mcp prefix here either",
+        })
+        assert result.success is False
+        assert "parse" in result.result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Sandbox eval (WS4 — Self-Modification)
+# ---------------------------------------------------------------------------
+class TestSandboxEval:
+    """Tests for sandbox_eval handler — safe code execution."""
+
+    def test_runs_simple_code(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nprint("hello world")\n```',
+            })
+        assert result.success is True
+        assert "hello world" in result.result["stdout"]
+        assert result.result["handler"] == "sandbox_eval"
+
+    def test_blocks_subprocess_import(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nimport subprocess\nsubprocess.run(["ls"])\n```',
+            })
+        assert result.success is False
+        assert "blocked" in result.result.get("error", "").lower() or result.result.get("safety") == "rejected"
+
+    def test_blocks_exec(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nexec("print(1)")\n```',
+            })
+        assert result.success is False
+
+    def test_blocks_eval(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\neval("1+1")\n```',
+            })
+        assert result.success is False
+
+    def test_blocks_os_system(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nimport os\nos.system("echo pwned")\n```',
+            })
+        assert result.success is False
+
+    def test_blocks_write_mode(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nopen("/etc/passwd", "w").write("hacked")\n```',
+            })
+        assert result.success is False
+
+    def test_timeout_kills_process(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir), \
+             patch.object(executor, "SANDBOX_TIMEOUT", 2):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": '```python\nimport time\ntime.sleep(60)\n```',
+            })
+        assert result.success is False
+        assert "timed out" in result.result["error"].lower()
+
+    def test_no_code_found(self, anah_dir):
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": "no code here just text",
+            })
+        assert result.success is False
+        assert "no code" in result.result["error"].lower()
+
+    def test_reads_from_generated_file(self, anah_dir):
+        gen_dir = anah_dir / "generated"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        script = gen_dir / "test_script.py"
+        script.write_text('print("from file")')
+
+        with patch.object(executor, "ANAH_DIR", anah_dir):
+            result = executor.handle_sandbox_eval({
+                "title": "sandbox_eval: test",
+                "description": f"file: {script}",
+            })
+        assert result.success is True
+        assert "from file" in result.result["stdout"]
+
+    def test_routing(self):
+        assert executor.route_task({"title": "sandbox_eval: run test", "description": ""}) == "sandbox_eval"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic handler loading (WS4)
+# ---------------------------------------------------------------------------
+class TestDynamicHandlers:
+    """Tests for custom handler loading and revert."""
+
+    def test_load_custom_handler(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+        (handler_dir / "greet.py").write_text(
+            "from executor import TaskResult\n"
+            "def handle(task):\n"
+            "    return TaskResult(True, {'greeting': 'hello', 'handler': 'custom_greet'}, 1.0)\n"
+        )
+
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            custom = executor.load_custom_handlers()
+
+        assert "custom_greet" in custom
+        result = custom["custom_greet"]({"title": "test"})
+        assert result.success is True
+        assert result.result["greeting"] == "hello"
+
+    def test_load_skips_bad_files(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+        (handler_dir / "broken.py").write_text("this is not valid python!!!")
+
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            custom = executor.load_custom_handlers()
+
+        assert "custom_broken" not in custom
+
+    def test_load_skips_missing_handle_func(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+        (handler_dir / "nohandle.py").write_text("x = 42\n")
+
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            custom = executor.load_custom_handlers()
+
+        assert "custom_nohandle" not in custom
+
+    def test_load_empty_dir(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            custom = executor.load_custom_handlers()
+
+        assert custom == {}
+
+    def test_load_nonexistent_dir(self, anah_dir):
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", anah_dir / "nope"):
+            custom = executor.load_custom_handlers()
+
+        assert custom == {}
+
+    def test_revert_custom_handler(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+        handler_file = handler_dir / "removeme.py"
+        handler_file.write_text("def handle(task): pass")
+
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            result = executor.revert_custom_handler("custom_removeme")
+
+        assert "reverted" in result
+        assert not handler_file.exists()
+
+    def test_revert_rejects_non_custom(self):
+        result = executor.revert_custom_handler("echo")
+        assert "error" in result
+
+    def test_revert_missing_file(self, anah_dir):
+        handler_dir = anah_dir / "custom_handlers"
+        handler_dir.mkdir(parents=True, exist_ok=True)
+        with patch.object(executor, "CUSTOM_HANDLERS_DIR", handler_dir):
+            result = executor.revert_custom_handler("custom_nonexistent")
+        assert "error" in result

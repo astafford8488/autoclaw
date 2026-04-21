@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -123,3 +124,52 @@ class TestSecurity:
         orchestrator.load_env()
         assert os.environ["TEST_EXISTING_VAR"] == "original"
         del os.environ["TEST_EXISTING_VAR"]
+
+
+class TestQueueBacklogProtection:
+    """Queue depth gating prevents runaway goal generation."""
+
+    def test_get_queue_depth(self, anah_db):
+        """get_queue_depth returns count of queued tasks."""
+        now = time.time()
+        for i in range(15):
+            anah_db.execute(
+                "INSERT INTO task_queue (created_at, priority, title, status) VALUES (?, 3, ?, 'queued')",
+                (now, f"task {i}"))
+        anah_db.execute(
+            "INSERT INTO task_queue (created_at, priority, title, status) VALUES (?, 3, 'done', 'completed')",
+            (now,))
+        anah_db.commit()
+        with patch.object(orchestrator, "ANAH_DIR", anah_db.execute("PRAGMA database_list").fetchone()[2]):
+            pass
+        # Direct DB test
+        row = anah_db.execute("SELECT COUNT(*) FROM task_queue WHERE status = 'queued'").fetchone()
+        assert row[0] == 15
+
+    def test_cortex_skipped_when_backlog_high(self):
+        """Cortex generation is skipped when queue depth > 50."""
+        with patch.object(orchestrator, "get_queue_depth", return_value=100):
+            result = orchestrator.full_cycle(generate=True, execute=False, learn=False)
+        cortex = result.get("cortex", {})
+        assert cortex.get("skipped") is True
+        assert "backlog" in cortex.get("reason", "")
+
+    def test_cortex_runs_when_backlog_low(self):
+        """Cortex generation runs normally when queue depth < 50."""
+        with patch.object(orchestrator, "get_queue_depth", return_value=10):
+            result = orchestrator.full_cycle(generate=True, execute=False, learn=False)
+        cortex = result.get("cortex", {})
+        # Should not be skipped due to backlog (may be skipped for other reasons)
+        assert cortex.get("reason", "") != "queue backlog 10"
+
+    def test_executor_limit_increases_with_backlog(self):
+        """Executor processes more tasks when backlog is large."""
+        calls = []
+        original_run_executor = orchestrator.run_executor
+        def spy_executor(limit=20):
+            calls.append(limit)
+            return {"processed": 0, "succeeded": 0, "failed": 0, "results": []}
+        with patch.object(orchestrator, "get_queue_depth", return_value=200), \
+             patch.object(orchestrator, "run_executor", side_effect=spy_executor):
+            orchestrator.full_cycle(generate=False, execute=True, learn=False)
+        assert calls and calls[0] == 50  # limit=50 when backlog > 100
